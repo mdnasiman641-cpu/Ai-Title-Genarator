@@ -20,6 +20,7 @@ from app.ai.transcription import (
     TranscriptService,
 )
 from app.context import AppContext
+from app.files.audio import AudioExtractor
 from app.i18n import set_language
 from app.ui import main_window as main_window_module
 from app.ui.content_analysis import COL_TITLE, COL_TRANSCRIPT
@@ -141,7 +142,8 @@ def test_service_options_never_hide_the_selection(window, ctx):
     assert ctx.settings.load().transcription_service == "missing-model" and combo.currentData() == "missing-model"
 
 
-def test_gemini_and_unsupported_providers_in_service_list(window, ctx):
+def test_gemini_and_unsupported_providers_in_service_list(window, ctx, monkeypatch):
+    monkeypatch.setattr(AudioExtractor, "available", property(lambda _self: True))  # CI machines may have no ffmpeg
     content = window.title_panel.content
     on_gemini = ctx.registry.add(ModelConfig.new("openai", "gemini-2.5-flash", base_url="https://generativelanguage.googleapis.com/v1beta/openai"),
                                  "AIza-test-0000000000")  # fmt: skip
