@@ -1,0 +1,5 @@
+# Runtime dependencies of AI Video File Assistant.
+# Gemini / OpenAI are called over plain HTTPS with the Python standard library,
+# so no vendor SDKs are needed. PySide6-Essentials is the Qt for Python subset the
+# app uses (Core, Gui, Widgets, Svg) - smaller than the full PySide6 meta package.
+PySide6-Essentials==6.11.2

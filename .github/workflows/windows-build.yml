@@ -1,0 +1,27 @@
+name: Windows build
+
+# Builds and tests the desktop app on a real Windows runner and uploads the .exe as an artifact.
+# Manual run:  Actions -> "Windows build" -> Run workflow.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build (runs the tests, PyInstaller, and the exe self-test)
+        shell: cmd
+        run: build.bat
+      - name: Upload the one-folder build
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Video-File-Assistant-windows
+          path: dist/AI Video File Assistant
+          if-no-files-found: error

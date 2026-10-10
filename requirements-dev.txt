@@ -1,0 +1,4 @@
+# Development / build-time tools (installed by build.bat in addition to requirements.txt).
+-r requirements.txt
+pytest==9.1.1
+pyinstaller==6.22.3

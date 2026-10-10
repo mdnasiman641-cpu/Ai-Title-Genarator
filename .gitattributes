@@ -1,0 +1,4 @@
+# Keep Windows batch files CRLF so cmd.exe parses labels and multi-line blocks reliably.
+*.bat text eol=crlf
+*.spec text eol=lf
+*.py text eol=lf
