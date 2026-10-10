@@ -32,6 +32,13 @@ from app.ai.ai_router import ModelRouter, make_router
 from app.ai.pipeline import PipelineRequest, PipelineResult
 from app.ai.task_analyzer import analyze_task
 from app.ai.title_config import load_current, save_current
+from app.ai.transcription import (
+    AUTO_SERVICE,
+    LOCAL_SERVICE,
+    LocalWhisperTranscriber,
+    make_transcript_service,
+    transcription_candidates,
+)
 from app.ai.web_search import make_search_service
 from app.config.constants import APP_NAME, FileKind, ProcessingMode
 from app.context import AppContext
@@ -55,6 +62,7 @@ from app.ui.widgets import Card, IconBinder, Retranslator, make_button, make_com
 from app.utils.helpers import classify_extension, resource_path
 from app.utils.logger import get_logger, setup_logging
 from app.workers.ai_worker import PlanWorker
+from app.workers.transcription_worker import TranscriptionWorker
 from app.workers.base_worker import BaseWorker
 from app.workers.metadata_worker import MetadataWorker, ThumbnailWorker, media_pool
 from app.workers.operation_worker import OperationWorker, UndoWorker
@@ -168,6 +176,12 @@ class MainWindow(QMainWindow):
         assert self.title_panel is not None
         self.title_panel.set_config(load_current(self.ctx.db))
         self.title_panel.changed.connect(self._on_title_settings_changed)
+        content = self.title_panel.content
+        content.analyze_requested.connect(self.analyze_videos)
+        content.cancel_requested.connect(self.cancel_analysis)
+        content.clear_cache_requested.connect(self.clear_transcript_cache)
+        content.service_changed.connect(self._on_transcription_service_changed)
+        self._analysis_worker: TranscriptionWorker | None = None
         self.command_panel.generate_requested.connect(self.generate_preview)
         self.command_panel.cancel_requested.connect(self.cancel_planning)
         self.command_panel.saved_prompt_chosen.connect(self._use_saved_prompt)
@@ -613,6 +627,7 @@ class MainWindow(QMainWindow):
             command=command, files=files, workspace=self.workspace, processing=self.command_panel.processing(),
             settings=settings, title=title_config if title_config.enabled else None,
             search=make_search_service(self.ctx) if title_config.enabled and title_config.uses_search else None,
+            transcripts=make_transcript_service(self.ctx) if title_config.enabled and title_config.source == "transcript" else None,
         )  # fmt: skip
         self._plan_generation += 1
         generation = self._plan_generation
@@ -676,10 +691,76 @@ class MainWindow(QMainWindow):
 
     def refresh_search_ui(self) -> None:
         self.title_panel.set_search_configured(make_search_service(self.ctx).configured)
+        self.refresh_transcription_ui()
+
+    # ========================================================= video content analysis
+    def refresh_transcription_ui(self) -> None:
+        """Offer Automatic, every OpenAI / OpenAI-compatible model with a key, and local only when installed."""
+        settings = self.ctx.settings.load()
+        options = [(tr("ca.service_auto"), AUTO_SERVICE)]
+        options += [(f"{m.display_name} — {m.label} (API)", m.id) for m in transcription_candidates(self.ctx.registry)]
+        if LocalWhisperTranscriber.available():
+            options.append((tr("ca.service_local"), LOCAL_SERVICE))
+        current = settings.transcription_service
+        if current not in {value for _label, value in options}:
+            options.append((tr("ca.service_missing"), current))  # never switch silently - show what is selected
+        self.title_panel.content.set_services(options, current, settings.transcription_model)
+        service = make_transcript_service(self.ctx)
+        text = tr("ca.backend", backend=service.label) if service.setup_error is None else service.setup_error.message
+        self.title_panel.content.set_backend_text(text)
+
+    def _on_transcription_service_changed(self, service: str, model: str) -> None:
+        self.settings = self.ctx.settings.update(transcription_service=service, transcription_model=model or "gpt-4o-mini-transcribe")
+        self.refresh_transcription_ui()
+
+    def analyze_videos(self) -> None:
+        """Transcribe the selected videos in the background and show the transcripts."""
+        if self._analysis_worker is not None or self._operation_running:
+            return
+        if self.workspace is None:
+            self.show_status(tr("status.choose_folder"), "warning")
+            return
+        files = self.files_panel.selected_entries()
+        if not files:
+            self.show_status(tr("pipeline.no_files"), "warning")
+            return
+        service = make_transcript_service(self.ctx)
+        if service.setup_error is not None:
+            self._show_error(service.setup_error.message)
+            return
+        cfg = self.title_panel.config()
+        content = self.title_panel.content
+        content.clear_results()
+        content.set_running(True)
+        worker = TranscriptionWorker(files, self.workspace, service, cfg.audio_seconds, cfg.transcript_language)
+        worker.signals.item.connect(content.add_result)  # type: ignore[attr-defined]
+        self._analysis_worker = worker
+        self.run_worker(
+            worker,
+            on_result=lambda _r: self._analysis_finished(tr("ca.done", ok=content.counts()[0], total=len(files)), "success"),
+            on_error=lambda msg, _e: self._analysis_finished(msg, "error"),
+            on_cancelled=lambda: self._analysis_finished(tr("ca.cancelled"), "warning"),
+        )
+
+    def cancel_analysis(self) -> None:
+        if self._analysis_worker is not None:
+            self._analysis_worker.cancel()
+            self.show_status(tr("ca.cancelling"))
+
+    def _analysis_finished(self, message: str, kind: str) -> None:
+        self._analysis_worker = None
+        self.title_panel.content.set_running(False)
+        self.show_status(message, kind)
+
+    def clear_transcript_cache(self) -> None:
+        removed = self.ctx.db.purge_transcript_cache()
+        self.show_status(tr("ca.cache_cleared", count=removed), "success")
 
     def refresh_models_ui(self) -> None:
         """Models were added / edited / removed: update the combos, the welcome banner and the AI label."""
         self.command_panel.refresh_models()
+        if hasattr(self, "title_panel"):
+            self.refresh_transcription_ui()
         self.welcome.setVisible(len(self.ctx.registry) == 0)
         self._update_ai_label()
 
@@ -729,6 +810,8 @@ class MainWindow(QMainWindow):
             self.command_panel.set_ai_text(result.provider_text)
         info = " — ".join(filter(None, [result.completion_text, plan.summary]))
         self.preview_panel.set_plan(plan, info)
+        if result.content_reports:  # Video Audio / Transcript: transcript, analysis and title per video
+            self.title_panel.content.show_reports(result.content_reports)
         QTimer.singleShot(0, self.reveal_preview)  # bring the new preview into view (the page scrolls)
         self._mark_file_statuses(plan)
         if plan.sort is not None:

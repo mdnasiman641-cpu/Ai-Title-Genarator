@@ -38,6 +38,7 @@ from app.ai.title_config import (
     save_preset,
 )
 from app.i18n import tr
+from app.ui.content_analysis import ContentAnalysisPanel
 from app.ui.widgets import Retranslator, confirm_destructive, install_wheel_guard
 
 
@@ -94,6 +95,10 @@ class TitlePanel(QWidget):
         body.setContentsMargins(16, 12, 16, 16)
         body.setSpacing(14)
         body.addLayout(self._build_main())
+        self.content = ContentAnalysisPanel()  # Video Content Analysis (audio -> transcript -> titles)
+        self.content.changed.connect(self._on_changed)
+        self.content.source_chosen.connect(self._on_content_source)
+        body.addWidget(self.content)
         body.addWidget(self._build_search())
         body.addLayout(self._build_presets())
         self.body.hide()
@@ -371,6 +376,7 @@ class TitlePanel(QWidget):
             compare_results=self.compare_results.isChecked(), context_only=self.context_only.isChecked(),
             completely_new=self.completely_new.isChecked(), search_fallback=self.search_fallback.isChecked(),
             prefix_counts=self.prefix_counts.isChecked(),
+            **self.content.values(),
         ).normalised()  # fmt: skip
 
     def set_config(self, config: TitleConfig, *, keep_enabled: bool = False) -> None:
@@ -395,6 +401,7 @@ class TitlePanel(QWidget):
                                (self.prefix_counts, cfg.prefix_counts)):  # fmt: skip
                 box.setChecked(value)
             self.instructions.setPlainText(cfg.custom_instructions)
+            self.content.set_values(cfg)
         finally:
             self._loading = False
         self._update_visibility()
@@ -426,6 +433,7 @@ class TitlePanel(QWidget):
         self.prefix.setEnabled(self.use_prefix.isChecked())
         self.prefix_counts.setEnabled(self.use_prefix.isChecked())
         source = data("source")
+        self.content.set_source(source)
         self.search_box.setVisible(source in ("search_ai", "search_only", "custom_prompt"))
         self.custom_query.setEnabled(data("query_mode") == "custom")
         configured = getattr(self, "_search_configured", True)
@@ -444,8 +452,14 @@ class TitlePanel(QWidget):
     def _on_changed(self, *_args: object) -> None:
         if self._loading:
             return
+        if self.sender() is self.source and self.source.currentData() == "transcript":
+            self.content.set_expanded(True)  # show duration / language / service right away
         self._update_visibility()
         self.changed.emit()
+
+    def _on_content_source(self, value: str) -> None:
+        """The Content source picker in Video Content Analysis drives the same Information source setting."""
+        self.source.setCurrentIndex(max(0, self.source.findData(value)))
 
     def _emit(self, *_args: object) -> None:
         if not self._loading:
@@ -505,6 +519,10 @@ class TitlePanel(QWidget):
             for i in range(combo.count()):
                 value = combo.itemData(i)
                 combo.setItemText(i, tr(f"{prefix}{value}") if prefix else str(value))
+        if hasattr(self, "content"):
+            self.content.retranslate()
+            self.content.set_source_options([(self.source.itemText(i), self.source.itemData(i)) for i in range(self.source.count())],
+                                            str(self.source.currentData()))  # fmt: skip
         self._update_visibility()
 
     _search_configured: bool = True

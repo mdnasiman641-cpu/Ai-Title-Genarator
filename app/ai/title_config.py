@@ -13,7 +13,9 @@ from dataclasses import asdict, dataclass, fields, replace
 from typing import Any
 
 TITLE_MODES = ("independent", "partial", "connected")
-SOURCES = ("ai_only", "search_ai", "search_only", "custom_prompt")
+SOURCES = ("transcript", "ai_only", "search_ai", "search_only", "custom_prompt")  # "transcript" = Video Audio / Transcript
+AUDIO_SECONDS_RANGE = (10, 600)
+TRANSCRIPT_LANGUAGES = ("auto", "en", "bn", "hi", "ur", "ar", "es", "fr", "de", "it", "pt", "ru", "tr", "ja", "ko", "zh")
 CATEGORIES = ("crime", "investigation", "mystery", "family", "drama", "action", "suspense", "justice", "police", "emotional", "custom")
 STYLES = ("cinematic", "story", "dramatic", "suspenseful", "professional", "simple", "emotional", "youtube", "facebook", "custom")
 TONES = ("neutral", "dramatic", "suspenseful", "emotional", "serious", "exciting", "professional", "custom")
@@ -59,6 +61,11 @@ class TitleConfig:
     context_only: bool = True
     completely_new: bool = True
     search_fallback: bool = True  # search failed -> continue with AI only
+    # --- Video Audio / Transcript options
+    audio_seconds: int = 180  # analyse the first 3 minutes of every video
+    transcript_language: str = "auto"
+    include_filename_context: bool = False  # filename only identifies the file unless the user allows it as context
+    transcript_fallback: bool = False  # transcription failed -> clearly labelled settings-based title (opt-in)
 
     # ------------------------------------------------------------ derived
     @property
@@ -111,6 +118,8 @@ class TitleConfig:
         out.capacity = _choice(out.capacity, tuple(CAPACITIES), "medium")
         out.variation = _choice(out.variation, VARIATIONS, "high")
         out.query_mode = _choice(out.query_mode, QUERY_MODES, "automatic")
+        out.audio_seconds = max(AUDIO_SECONDS_RANGE[0], min(int(out.audio_seconds), AUDIO_SECONDS_RANGE[1]))
+        out.transcript_language = _choice(out.transcript_language, TRANSCRIPT_LANGUAGES, "auto")
         out.max_results = min(MAX_RESULTS, key=lambda n: abs(n - int(out.max_results)))
         out.min_words = max(MIN_WORDS, min(int(out.min_words), MAX_WORDS))
         out.max_words = max(out.min_words, min(int(out.max_words), MAX_WORDS))

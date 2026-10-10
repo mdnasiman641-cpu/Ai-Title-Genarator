@@ -64,9 +64,15 @@ def request_json(
     headers: dict[str, str],
     payload: dict[str, Any] | None = None,
     timeout: float = 60,
+    body: bytes | None = None,
 ) -> dict[str, Any]:
-    """Send a JSON request and return the decoded JSON object, raising :class:`AIError` on failure."""
-    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    """Send a JSON request and return the decoded JSON object, raising :class:`AIError` on failure.
+
+    ``body`` sends pre-encoded bytes instead of ``payload`` (e.g. a multipart audio upload); the
+    caller then supplies the matching ``Content-Type`` header.
+    """
+    if body is None:
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
     all_headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": _USER_AGENT, **headers}
     request = urllib.request.Request(url, data=body, headers=all_headers, method=method)  # noqa: S310 - https only
     try:

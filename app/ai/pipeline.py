@@ -16,6 +16,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from app.ai.ai_router import (
     InvalidAnswer,
@@ -36,6 +37,7 @@ from app.ai.response_parser import ResponseError, parse_response
 from app.ai.schemas import Action, ParsedResponse, RejectedAction
 from app.ai.task_analyzer import TaskProfile, analyze_task
 from app.ai.title_config import TitleConfig
+from app.ai.transcription import TranscriptService
 from app.ai.web_search import SearchService
 from app.config.constants import ProcessingMode, TaskType
 from app.config.settings import AppSettings
@@ -75,6 +77,7 @@ class PipelineRequest:
     settings: AppSettings
     title: TitleConfig | None = None  # Title Generator settings (used when ``title.enabled``)
     search: SearchService | None = None  # Google Search context for the Title Generator
+    transcripts: TranscriptService | None = None  # Video Audio / Transcript source of the Title Generator
 
 
 @dataclass(slots=True)
@@ -92,6 +95,7 @@ class PipelineResult:
     warnings: list[str] = field(default_factory=list)
     route_details: list[str] = field(default_factory=list)
     files: int = 0
+    content_reports: list[Any] = field(default_factory=list)  # Title Generator transcript details per file
 
     @property
     def completion_text(self) -> str:
@@ -263,6 +267,7 @@ def _run_title_generator(
         raise PipelineError(tr("title.offline_only"))
     generator = TitleGenerator(
         request.files, request.title or TitleConfig(enabled=True), router, command=request.command, search=request.search,
+        transcripts=request.transcripts, workspace=request.workspace,
         include_metadata=request.settings.send_metadata_to_ai, batch_size=request.settings.batch_size, cancel=cancel,
         progress=progress,
     )  # fmt: skip
@@ -280,6 +285,6 @@ def _run_title_generator(
     )  # fmt: skip
     return PipelineResult(
         plan=plan, summary=parsed.summary, warnings=list(parsed.warnings), task_type=TaskType.TITLE_GENERATION.value,
-        files=len(request.files), **outcome.meta,
+        files=len(request.files), content_reports=outcome.reports, **outcome.meta,
     )  # fmt: skip
 

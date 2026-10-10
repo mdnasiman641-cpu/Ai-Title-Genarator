@@ -16,7 +16,7 @@ review a colour-coded **preview**, click **Apply**, and can **Undo** the whole b
 3. [How a command is processed](#how-a-command-is-processed)
 4. [Safety model](#safety-model)
 5. [AI models, routing and fallback](#ai-models-routing-and-fallback)
-6. [Title Generator (unique titles, Google Search context, presets)](#title-generator)
+6. [Title Generator (unique titles, Google Search context, presets)](#title-generator) · [Video Audio / Transcript](#video-audio--transcript)
 7. [Command examples](#command-examples)
 8. [Undo, history and the undo-trash](#undo-history-and-the-undo-trash)
 9. [Optional: durations and thumbnails (ffmpeg)](#optional-durations-and-thumbnails-ffmpeg)
@@ -144,7 +144,7 @@ Open **Title Generator** in the AI Command card, tick **Use for the next preview
 | Option | Values |
 |---|---|
 | Title mode | **Independent Creative** (default — the file name is only an identifier and is *never sent* to the AI), Partially Connected (loose inspiration), Connected to Filename |
-| Information source | **Gemini / AI only** (default), Google Search + Gemini / AI, Google Search only, Custom prompt |
+| Information source | **Video Audio / Transcript** (see below), **Gemini / AI only** (default), Google Search + Gemini / AI, Google Search only, Custom prompt |
 | Category · Content/Topic · Keywords | Crime … Emotional or a custom category; free-text topic; comma-separated keywords (used naturally, not forced into every title) |
 | Style · Tone | Cinematic, Story, Dramatic, Suspenseful, Professional, Simple, Emotional, YouTube, Facebook, custom · Neutral … Professional, custom |
 | Word capacity | Short 5–8 · Medium 8–12 · Long 12–18 · Custom min/max. The **series prefix does not count** unless *Prefix counts as words* is ticked |
@@ -168,6 +168,31 @@ terms confirmed by several sources and disagreements marked — and sent as **co
 (*If Google Search fails, continue with AI only*, on by default) and the preview says so. *Google Search only* uses no AI: it can name episodes from
 search results (Connected modes) but refuses Independent Creative titles because those need an AI model. *Custom prompt* lets your instructions lead
 (mention "search" to add search context). The preview's note column shows `Search: ✓ 5 results · AI: Gemini / gemini-2.5-flash` per file.
+
+### Video Audio / Transcript
+Choose **Video Audio / Transcript** as the information source (or in the expandable **Video Content Analysis** section) and the titles are built from what is
+actually **said** in each video, not from its file name.
+
+1. ffmpeg extracts only the **first N seconds** of audio (60 s, 2, **3 (default)**, 5 min or custom 10–600 s) into a temporary mono 16 kHz WAV.
+   The video is never modified; the temporary folder is always deleted.
+2. The clip is transcribed by the selected **transcription service**, chosen under *Video Content Analysis → Transcription service*. The active backend is always shown,
+   e.g. `Transcription: OpenAI / gpt-4o-mini-transcribe (API)`:
+   - **Automatic** — the first configured OpenAI / OpenAI-compatible model in *AI Models*. Its base URL and its encrypted key are reused; no new key is stored.
+     The audio goes to its `/audio/transcriptions` endpoint (default model `gpt-4o-mini-transcribe`, editable, e.g. `whisper-1`). **API-based**: the audio is uploaded.
+   - **A specific OpenAI / OpenAI-compatible model** from the list.
+   - **Local (faster-whisper)** — offered only when the optional `faster-whisper` package is installed. **Local**: nothing is uploaded.
+   - Gemini text models are **not** used for transcription. If the chosen service is missing or unconfigured, the app says so and **never switches silently**.
+3. The transcript (trimmed if very long) goes through the normal AI router (same models, fallback, batching) with the Title Generator settings. The AI must
+   separate **supported facts**, **interpretation** and **unknowns**, and may not invent events. The file name is sent only if *Include filename as additional
+   context* is ticked (off by default).
+4. Titles pass the usual uniqueness checks and go to the normal **preview → Apply → Undo**; extensions are kept.
+
+Videos without audio, damaged files or failed transcriptions are **skipped and reported** (Successful / Failed / Skipped). They are titled only if *If transcription
+fails, still title it* is ticked, and those titles are marked **not transcript-based** in the preview and in the analysis table.
+**Analyze Selected Videos** transcribes in the background (progress `Video 3 / 100 — Transcribing…`, **Cancel** stops before the next video) and shows
+per video: audio, transcription status, analyzed range (`00:00–03:00`), the transcript and, after Generate Preview, the content analysis and generated title.
+Transcripts are **cached** in the local database by file (path, size, modification time), duration, language and backend. A changed file is transcribed again,
+failures are retried next time, and **Clear Transcript Cache** removes them all.
 
 **Presets.** *Save Preset / Load Preset / Delete Preset* store the complete configuration (e.g. "Blue Bloods Facebook Titles") in the local database;
 the current panel settings are also restored automatically at start-up.

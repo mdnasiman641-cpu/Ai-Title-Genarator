@@ -61,6 +61,10 @@ class AppSettings:
     search_engine_id: str = ""
     search_endpoint: str = GOOGLE_SEARCH_ENDPOINT
     search_cache_hours: int = 24
+    # --- Video audio transcription (Title Generator "Video Audio / Transcript")
+    transcription_service: str = "auto"  # "auto" (first OpenAI model), a model configuration id, or "local"
+    transcription_model: str = "gpt-4o-mini-transcribe"
+    transcription_timeout_s: int = 120
     # --- File operations
     ask_before_apply: bool = True
     create_history: bool = True
@@ -99,6 +103,9 @@ class AppSettings:
         out.sample_size = max(1, min(int(out.sample_size), MAX_BATCH_SIZE))
         out.request_timeout_s = max(5, min(int(out.request_timeout_s), 600))
         out.search_cache_hours = max(0, min(int(out.search_cache_hours), 720))
+        out.transcription_service = out.transcription_service.strip() or "auto"
+        out.transcription_model = out.transcription_model.strip()[:120] or "gpt-4o-mini-transcribe"
+        out.transcription_timeout_s = max(10, min(int(out.transcription_timeout_s), 900))
         out.search_endpoint = out.search_endpoint.strip() or GOOGLE_SEARCH_ENDPOINT
         out.search_engine_id = out.search_engine_id.strip()[:120]
         return out

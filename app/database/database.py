@@ -26,7 +26,7 @@ from app.utils.logger import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -85,6 +85,11 @@ CREATE TABLE IF NOT EXISTS title_presets (
 );
 CREATE TABLE IF NOT EXISTS search_cache (
     query   TEXT PRIMARY KEY,
+    created REAL NOT NULL,
+    data    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS transcript_cache (
+    key     TEXT PRIMARY KEY,
     created REAL NOT NULL,
     data    TEXT NOT NULL
 );
@@ -413,4 +418,22 @@ class Database:
 
     def count_search_cache(self) -> int:
         return int(self._connection().execute("SELECT COUNT(*) FROM search_cache").fetchone()[0])
+
+    # ------------------------------------------------------- transcript cache
+    def get_transcript_cache(self, key: str) -> dict[str, object] | None:
+        row = self._connection().execute("SELECT data FROM transcript_cache WHERE key = ?", (key,)).fetchone()
+        return None if row is None else json.loads(row["data"])
+
+    def put_transcript_cache(self, key: str, created: float, data: dict[str, object]) -> None:
+        self._connection().execute(
+            "INSERT INTO transcript_cache(key, created, data) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET created = excluded.created, data = excluded.data",
+            (key, created, json.dumps(data, ensure_ascii=False)),
+        )
+
+    def purge_transcript_cache(self) -> int:
+        return self._connection().execute("DELETE FROM transcript_cache").rowcount or 0
+
+    def count_transcript_cache(self) -> int:
+        return int(self._connection().execute("SELECT COUNT(*) FROM transcript_cache").fetchone()[0])
 
