@@ -40,7 +40,7 @@ MAX_TRANSCRIPT_CHARS = 200_000
 
 
 class TranscriptionError(Exception):
-    """``kind``: not_configured, auth, rate_limit, timeout, network, server, invalid, unsupported, failed."""
+    """``kind``: not_configured, auth, quota, rate_limit, timeout, network, server, invalid, unsupported, too_large, failed."""
 
     def __init__(self, kind: str, message: str) -> None:
         super().__init__(message)
@@ -119,12 +119,46 @@ class ApiTranscriber(Transcriber):
             data = request_json(self.label, "POST", f"{self.config.base_url}/audio/transcriptions", headers=headers,
                                 body=body, timeout=self.timeout)  # fmt: skip
         except AIError as exc:
-            raise TranscriptionError(_ERROR_KINDS.get(exc.kind, "failed"), exc.user_message) from None
+            error = self._explain(exc)
+            log.warning("transcription request failed: %s (HTTP %s) %s", error.kind, exc.status or "-", exc.detail)  # detail is redacted
+            raise error from None
         text = data.get("text")
         if not isinstance(text, str):
-            raise TranscriptionError("invalid", "The transcription service returned no text field.")
+            raise TranscriptionError("invalid", "Invalid API response: the transcription service returned no 'text' field.")
         detected = str(data.get("language") or (language if language != "auto" else ""))
         return text.strip()[:MAX_TRANSCRIPT_CHARS], detected
+
+
+    def _explain(self, exc: AIError) -> TranscriptionError:
+        """Actionable message with the HTTP status and the service's own explanation (never the key)."""
+        status = f" (HTTP {exc.status})" if exc.status else ""
+        said = f" The service said: {exc.detail}" if exc.detail else ""
+        where = f"'{self.config.display_name}' ({self.config.base_url})"
+        lowered = exc.detail.lower()
+        if exc.kind == ErrorKind.AUTH:
+            return TranscriptionError("auth", f"API authentication failed{status}.{said} Check the API key of {where} in Settings → AI → AI Models"
+                                      " (a restricted key also needs permission for audio).")  # fmt: skip
+        if exc.kind == ErrorKind.RATE_LIMIT:
+            if "quota" in lowered or "billing" in lowered or "credit" in lowered:
+                return TranscriptionError("quota", f"API quota exhausted{status}.{said} Add credit or a payment method to the account of {where}.")
+            return TranscriptionError("rate_limit", f"Rate limit exceeded{status}.{said} Wait a minute and analyse again.")
+        if exc.kind == ErrorKind.MODEL_NOT_FOUND or (exc.kind == ErrorKind.BAD_REQUEST and "model" in lowered):
+            return TranscriptionError("unsupported", f"Model unavailable{status}: '{self.model}' is not available for speech-to-text at {where}.{said}"
+                                      " Use gpt-4o-mini-transcribe, gpt-4o-transcribe or whisper-1 with OpenAI.")  # fmt: skip
+        if exc.status == 413 or "too large" in lowered or "maximum content size" in lowered:
+            return TranscriptionError("too_large", f"Audio upload failed{status}: the audio clip is too large for the service. Choose a shorter duration.")
+        if exc.kind == ErrorKind.BAD_REQUEST:
+            return TranscriptionError("unsupported", f"The transcription request was rejected{status}.{said}")
+        if exc.kind == ErrorKind.TIMEOUT:
+            return TranscriptionError("timeout", f"Network timeout{status}: no answer from {where} within {self.timeout:.0f}s."
+                                      " Try a shorter duration or a longer timeout.")  # fmt: skip
+        if exc.kind == ErrorKind.NETWORK:
+            return TranscriptionError("network", f"Audio upload failed: {where} could not be reached ({exc.detail or 'network error'}).")
+        if exc.kind == ErrorKind.SERVER:
+            return TranscriptionError("server", f"The transcription service had a server error{status}.{said} Try again shortly.")
+        if exc.kind == ErrorKind.INVALID_RESPONSE:
+            return TranscriptionError("invalid", f"Invalid API response from {where}: {exc.detail}")
+        return TranscriptionError(_ERROR_KINDS.get(exc.kind, "failed"), f"Transcription failed{status}.{said}")
 
 
 class LocalWhisperTranscriber(Transcriber):
@@ -221,6 +255,20 @@ class TranscriptResult:
         return data
 
 
+_PER_FILE_KINDS = ("no_audio", "unreadable", "empty")
+
+
+def main_failure(results: list[TranscriptResult]) -> TranscriptResult | None:
+    """The failure that explains most videos - service problems (key, quota, model, network) before per-file ones."""
+    failed = [r for r in results if r.status == "failed" and r.error]
+    if not failed:
+        return None
+    counts: dict[str, int] = {}
+    for result in failed:
+        counts[result.error_kind] = counts.get(result.error_kind, 0) + 1
+    return max(failed, key=lambda r: (r.error_kind not in _PER_FILE_KINDS, counts[r.error_kind]))
+
+
 class TranscriptService:
     """Audio extraction + transcription + cache. One instance per batch (deduplicates within it)."""
 
@@ -300,6 +348,9 @@ class TranscriptService:
         except TranscriptionError as exc:
             log.warning("transcription failed (%s) for %s", exc.kind, source.name)
             return TranscriptResult("failed", error=exc.message, error_kind=exc.kind, backend=backend)
+        except Exception as exc:  # noqa: BLE001 - one video's unexpected problem must not end the whole batch
+            log.exception("unexpected transcription error for %s", source.name)
+            return TranscriptResult("failed", error=f"Transcription failed: {type(exc).__name__}: {exc}", error_kind="failed", backend=backend)
         if not text.strip():
             return TranscriptResult("empty", language=detected, analyzed_seconds=analyzed, backend=backend,
                                     error="No speech was recognised in the analysed part.", error_kind="empty")  # fmt: skip
@@ -319,6 +370,6 @@ def make_transcript_service(ctx: Any) -> TranscriptService:
         return TranscriptService(extractor, None, ctx.db, setup_error=exc)
     if not extractor.available:
         return TranscriptService(extractor, transcriber, ctx.db,
-                                 setup_error=TranscriptionError("no_ffmpeg", "ffmpeg was not found (Settings → General → ffmpeg folder)."))  # fmt: skip
+                                 setup_error=TranscriptionError("no_ffmpeg", "FFmpeg not found. Install ffmpeg or set its folder in Settings → General → ffmpeg folder."))  # fmt: skip
     return TranscriptService(extractor, transcriber, ctx.db)
 

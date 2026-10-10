@@ -22,8 +22,10 @@ from app.ai.transcription import (
     LocalWhisperTranscriber,
     Transcriber,
     TranscriptionError,
+    TranscriptResult,
     TranscriptService,
     build_transcriber,
+    main_failure,
     make_transcript_service,
 )
 from app.config.constants import ProcessingMode
@@ -61,9 +63,9 @@ class FakeExtractor:
     def extracted_audio(self, source: Path, seconds: float):
         self.calls.append((source.name, seconds))
         if "silent" in source.name:
-            raise AudioError("no_audio", "The video has no audio track.")
+            raise AudioError("no_audio", "Video contains no audio stream.")
         if "broken" in source.name:
-            raise AudioError("unreadable", "The video could not be read (damaged or unsupported file).")
+            raise AudioError("unreadable", "Audio extraction failed: the video could not be read (damaged or unsupported file).")
         workdir = Path(tempfile.mkdtemp())
         self.dirs.append(workdir)
         clip = workdir / "clip.wav"
@@ -160,10 +162,10 @@ def test_no_audio_and_unreadable_files(tmp_path):
     extractor = AudioExtractor()
     with pytest.raises(AudioError) as err, extractor.extracted_audio(silent, 30):
         pass
-    assert err.value.kind == "no_audio"
+    assert err.value.kind == "no_audio" and err.value.message == "Video contains no audio stream."
     with pytest.raises(AudioError) as err2, extractor.extracted_audio(broken, 30):
         pass
-    assert err2.value.kind == "unreadable"
+    assert err2.value.kind == "unreadable" and err2.value.message.startswith("Audio extraction failed") and "ffmpeg:" in err2.value.message
 
 
 def test_missing_ffmpeg_is_reported(tmp_path, monkeypatch):
@@ -191,6 +193,61 @@ def test_api_transcriber_uploads_audio_only(tmp_path):
     body = sent["body"]
     assert 'name="model"' in body and "gpt-4o-mini-transcribe" in body and 'name="language"' in body
     assert 'filename="clip.wav"' in body and "WAVEdata1234" in body
+
+
+OPENAI_ERRORS = [  # real OpenAI error bodies -> kind + the headline the user sees
+    (401, {"message": "Incorrect API key provided: sk-proj-****WXYZ.", "code": "invalid_api_key"}, "auth", "API authentication failed (HTTP 401)"),
+    (429, {"message": "You exceeded your current quota, please check your plan and billing details.", "code": "insufficient_quota"},
+     "quota", "API quota exhausted (HTTP 429)"),
+    (429, {"message": "Rate limit reached for requests. Please try again in 20s.", "code": "rate_limit_exceeded"}, "rate_limit",
+     "Rate limit exceeded (HTTP 429)"),
+    (400, {"message": "The model `gpt-4o-mini` does not exist or you do not have access to it.", "code": "model_not_found"}, "unsupported",
+     "Model unavailable (HTTP 400)"),
+    (404, {"message": "Invalid URL (POST /v1/audio/transcriptions)"}, "unsupported", "Model unavailable (HTTP 404)"),
+    (413, {"message": "Maximum content size limit exceeded."}, "too_large", "Audio upload failed (HTTP 413)"),
+    (500, {"message": "The server had an error while processing your request."}, "server", "server error (HTTP 500)"),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(("status", "error", "kind", "headline"), OPENAI_ERRORS)
+def test_api_errors_explain_the_actual_failure(tmp_path, status, error, kind, headline):
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"RIFF")
+    with FakeAIServer() as srv:
+        srv.queue(status, {"error": error})
+        with pytest.raises(TranscriptionError) as err:
+            ApiTranscriber(ModelConfig.new("openai", "m", base_url=srv.base), "sk-secret-key-000000000", "gpt-4o-mini-transcribe", 5).transcribe(clip, "auto")
+    assert err.value.kind == kind and headline in err.value.message
+    assert status == 413 or error["message"].split(" ")[0] in err.value.message  # the service's own explanation is shown
+    assert "sk-secret-key" not in err.value.message
+
+
+def test_unreachable_service_and_unexpected_errors(ctx, tmp_path):
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"RIFF")
+    with pytest.raises(TranscriptionError) as err:
+        ApiTranscriber(ModelConfig.new("openai", "m", base_url="http://127.0.0.1:9"), "k", "whisper-1", 3).transcribe(clip, "auto")
+    assert err.value.kind in ("network", "timeout") and ("Audio upload failed" in err.value.message or "Network timeout" in err.value.message)
+
+    class Exploding(FakeTranscriber):
+        def transcribe(self, audio, language):
+            if b"case" in audio.read_bytes():
+                raise ValueError("boom")
+            return super().transcribe(audio, language)
+
+    service = TranscriptService(FakeExtractor(), Exploding(), ctx.db)
+    (tmp_path / "case.mp4").write_bytes(b"1")
+    (tmp_path / "family.mp4").write_bytes(b"2")
+    first, second = service.get(tmp_path / "case.mp4", 60), service.get(tmp_path / "family.mp4", 60)
+    assert first.status == "failed" and "ValueError: boom" in first.error  # only this video failed
+    assert second.ok
+
+
+def test_main_failure_prefers_service_problems():
+    per_file = TranscriptResult("failed", error="Audio extraction failed: damaged.", error_kind="unreadable")
+    auth = TranscriptResult("failed", error="API authentication failed (HTTP 401).", error_kind="auth")
+    assert main_failure([per_file, auth, auth]) is auth and main_failure([per_file]) is per_file
+    assert main_failure([TranscriptResult("no_audio", error="Video contains no audio stream.")]) is None
 
 
 @pytest.mark.parametrize(("status", "kind"), [(429, "rate_limit"), (401, "auth"), (500, "server"), (404, "unsupported")])

@@ -55,7 +55,7 @@ class AudioExtractor:
     def extracted_audio(self, source: Path, seconds: float) -> Iterator[AudioClip]:
         """Yield a temporary WAV of the first ``seconds`` of ``source``; it is deleted afterwards."""
         if self.binary is None:
-            raise AudioError("no_ffmpeg", "ffmpeg was not found (Settings → General → ffmpeg folder).")
+            raise AudioError("no_ffmpeg", "FFmpeg not found. Install ffmpeg or set its folder in Settings → General → ffmpeg folder.")
         seconds = max(1.0, min(float(seconds), MAX_SECONDS))
         workdir = Path(tempfile.mkdtemp(prefix="aivfa-audio-"))
         target = workdir / "clip.wav"
@@ -70,17 +70,18 @@ class AudioExtractor:
                     command, capture_output=True, timeout=EXTRACT_TIMEOUT_S, creationflags=subprocess_flags(), check=False
                 )  # fmt: skip
             except subprocess.TimeoutExpired:
-                raise AudioError("timeout", f"Extracting the audio took longer than {EXTRACT_TIMEOUT_S}s.") from None
+                raise AudioError("timeout", f"Audio extraction failed: it took longer than {EXTRACT_TIMEOUT_S}s.") from None
             except OSError as exc:
-                raise AudioError("no_ffmpeg", f"ffmpeg could not be started: {exc}") from None
+                raise AudioError("no_ffmpeg", f"FFmpeg not found or could not be started: {exc}") from None
             stderr = done.stderr.decode("utf-8", "replace").strip()
             size = target.stat().st_size if target.is_file() else 0
             if done.returncode != 0 or size <= 44:  # 44 bytes = a WAV header without samples
                 lowered = stderr.lower()
                 if size <= 44 and (done.returncode == 0 or any(h in lowered for h in _NO_AUDIO_HINTS)):
-                    raise AudioError("no_audio", "The video has no audio track.")
+                    raise AudioError("no_audio", "Video contains no audio stream.")
                 log.info("audio extraction failed for %s: %s", source.name, stderr[-300:])
-                raise AudioError("unreadable", "The video could not be read (damaged or unsupported file).")
+                reason = stderr.splitlines()[-1][:200] if stderr else f"ffmpeg exit code {done.returncode}"
+                raise AudioError("unreadable", f"Audio extraction failed: the video could not be read (damaged or unsupported file). ffmpeg: {reason}")
             clip_seconds = (size - 44) / (SAMPLE_RATE * 2)
             yield AudioClip(target, round(clip_seconds, 2))
         finally:

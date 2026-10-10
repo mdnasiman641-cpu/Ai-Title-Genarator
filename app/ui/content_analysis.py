@@ -284,14 +284,18 @@ class ContentAnalysisPanel(QFrame):
             tr("ca.audio_ok") if result.status in ("ok", "empty") else "—")  # fmt: skip
         status_key = {"ok": "ca.status_ok", "empty": "ca.status_empty", "no_audio": "ca.status_skipped"}.get(result.status, "ca.status_failed")
         status = tr(status_key) + (f" · {tr('ca.cached')}" if result.from_cache else "")
+        if result.status == "failed" and result.error:
+            status += f" — {error_headline(result.error)}"  # the actual reason, not just "Failed"
         item.setText(COL_AUDIO, audio)
         item.setText(COL_TRANSCRIPT, status)
+        item.setToolTip(COL_TRANSCRIPT, result.error or status)
         item.setText(COL_RANGE, result.analyzed_range if result.analyzed_seconds else "—")
         item.takeChildren()
         if result.ok:
             self._child(item, tr("ca.transcript"), result.text)
         if result.error:
             self._child(item, tr("ca.error"), result.error)
+        item.setExpanded(result.status == "failed")  # show the full explanation of failures straight away
         self.results.show()
         self._update_summary()
 
@@ -362,6 +366,12 @@ class ContentAnalysisPanel(QFrame):
         self.results.setHeaderLabels([tr("ca.col_file"), tr("ca.col_audio"), tr("ca.col_transcript"), tr("ca.col_range"),
                                       tr("ca.col_title")])  # fmt: skip
         self.set_running(self._running)
+
+
+def error_headline(message: str) -> str:
+    """First sentence of an error, e.g. ``API authentication failed (HTTP 401)``."""
+    first = message.strip().splitlines()[0] if message.strip() else ""
+    return first.split(". ")[0].rstrip(".")[:100]
 
 
 def _minutes(seconds: Any) -> str:

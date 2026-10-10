@@ -11,7 +11,14 @@ from PySide6.QtWidgets import QMessageBox
 from app.ai.model_config import ModelConfig
 from app.ai.title_config import TitleConfig
 from app.ai.title_generator import ContentReport
-from app.ai.transcription import AUTO_SERVICE, LOCAL_SERVICE, LocalWhisperTranscriber, TranscriptResult, TranscriptService
+from app.ai.transcription import (
+    AUTO_SERVICE,
+    LOCAL_SERVICE,
+    LocalWhisperTranscriber,
+    TranscriptionError,
+    TranscriptResult,
+    TranscriptService,
+)
 from app.context import AppContext
 from app.i18n import set_language
 from app.ui import main_window as main_window_module
@@ -151,6 +158,27 @@ def test_analyze_selected_videos_in_background(window, ctx, workspace, monkeypat
     assert ctx.db.count_transcript_cache() == 3  # ok + ok + no audio; the unreadable file is retried next time
     window.clear_transcript_cache()
     assert ctx.db.count_transcript_cache() == 0 and "3" in window.status_label.text()
+
+
+class RejectedKey(FakeTranscriber):
+    def transcribe(self, audio, language):
+        raise TranscriptionError("auth", "API authentication failed (HTTP 401). The service said: Incorrect API key provided. Check the API key.")
+
+
+def test_failures_show_the_actual_reason(window, ctx, workspace, monkeypatch):
+    fake_service(monkeypatch, ctx, RejectedKey())
+    load(window, workspace, "a_broken.mp4", "case.mp4", "family.mp4")
+    content = window.title_panel.content
+    window.analyze_videos()
+    assert wait_until(lambda: window._analysis_worker is None, timeout=8)
+    rows = {content.results.topLevelItem(i).text(0): content.results.topLevelItem(i) for i in range(3)}
+    assert rows["case.mp4"].text(COL_TRANSCRIPT) == "Failed — API authentication failed (HTTP 401)"
+    assert rows["a_broken.mp4"].text(COL_TRANSCRIPT).startswith("Failed — Audio extraction failed")
+    assert rows["case.mp4"].isExpanded() and "Incorrect API key provided" in rows["case.mp4"].child(0).text(0)
+    assert content.counts() == (0, 3, 0)
+    # the status bar names the reason shared by most videos, not the first file's
+    assert window.status_label.text() == "Transcription finished: 0 of 3 videos. — API authentication failed (HTTP 401)"
+    assert window.status_label.objectName() == "Danger"
 
 
 def test_cancel_analysis(window, ctx, workspace, monkeypatch):

@@ -37,7 +37,7 @@ from app.ai.schemas import ParsedResponse, RenameAction
 from app.ai.task_analyzer import TaskProfile
 from app.ai.title_config import TitleConfig, apply_command_overrides
 from app.ai.title_quality import check_titles, count_words
-from app.ai.transcription import TranscriptResult, TranscriptService
+from app.ai.transcription import TranscriptResult, TranscriptService, main_failure
 from app.ai.web_search import (
     SearchContext,
     SearchError,
@@ -381,8 +381,8 @@ class TitleGenerator:
         else:
             self.active = ok
         if not self.active:
-            first = self.results[failed[0]] if failed else None
-            raise PipelineError(tr("transcript.none", reason=first.error if first else "-"))
+            main = main_failure([self.results[i] for i in failed])
+            raise PipelineError(tr("transcript.none", reason=main.error if main else "-"))
 
     def _transcript_summary(self) -> str:
         ok = sum(r.ok for r in self.results.values())

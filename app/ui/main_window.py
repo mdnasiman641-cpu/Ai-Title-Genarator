@@ -36,6 +36,7 @@ from app.ai.transcription import (
     AUTO_SERVICE,
     LOCAL_SERVICE,
     LocalWhisperTranscriber,
+    main_failure,
     make_transcript_service,
     transcription_candidates,
 )
@@ -50,6 +51,7 @@ from app.files.scanner import FileEntry, ScanResult
 from app.files.thumbnails import ThumbnailCache
 from app.i18n import set_language, tr
 from app.ui.command_panel import CommandPanel
+from app.ui.content_analysis import error_headline
 from app.ui.files_panel import FilesPanel
 from app.ui.history_window import HistoryDialog
 from app.ui.model_choice import AUTO
@@ -62,11 +64,11 @@ from app.ui.widgets import Card, IconBinder, Retranslator, make_button, make_com
 from app.utils.helpers import classify_extension, resource_path
 from app.utils.logger import get_logger, setup_logging
 from app.workers.ai_worker import PlanWorker
-from app.workers.transcription_worker import TranscriptionWorker
 from app.workers.base_worker import BaseWorker
 from app.workers.metadata_worker import MetadataWorker, ThumbnailWorker, media_pool
 from app.workers.operation_worker import OperationWorker, UndoWorker
 from app.workers.scan_worker import ScanWorker
+from app.workers.transcription_worker import TranscriptionWorker
 
 log = get_logger("ui.main")
 
@@ -737,10 +739,20 @@ class MainWindow(QMainWindow):
         self._analysis_worker = worker
         self.run_worker(
             worker,
-            on_result=lambda _r: self._analysis_finished(tr("ca.done", ok=content.counts()[0], total=len(files)), "success"),
+            on_result=lambda results: self._analysis_finished(*self._analysis_summary(results, len(files))),
             on_error=lambda msg, _e: self._analysis_finished(msg, "error"),
             on_cancelled=lambda: self._analysis_finished(tr("ca.cancelled"), "warning"),
         )
+
+    @staticmethod
+    def _analysis_summary(results: list, total: int) -> tuple[str, str]:
+        """Status-bar text; when nothing could be transcribed it names the reason instead of only counting."""
+        ok = sum(1 for _path, r in results if r.ok)
+        message = tr("ca.done", ok=ok, total=total)
+        main = main_failure([r for _path, r in results])
+        if main is not None and ok == 0:
+            return f"{message} — {error_headline(main.error)}", "error"
+        return message, "success" if main is None else "warning"
 
     def cancel_analysis(self) -> None:
         if self._analysis_worker is not None:
