@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -19,14 +20,17 @@ from app.ai.title_config import TitleConfig
 from app.ai.title_generator import MAX_TRANSCRIPT_PROMPT_CHARS, _trim_transcript
 from app.ai.transcription import (
     ApiTranscriber,
+    GeminiAudioTranscriber,
     LocalWhisperTranscriber,
     Transcriber,
     TranscriptionError,
     TranscriptResult,
     TranscriptService,
     build_transcriber,
+    gemini_candidates,
     main_failure,
     make_transcript_service,
+    transcription_candidates,
 )
 from app.config.constants import ProcessingMode
 from app.config.settings import AppSettings
@@ -202,8 +206,8 @@ OPENAI_ERRORS = [  # real OpenAI error bodies -> kind + the headline the user se
     (429, {"message": "Rate limit reached for requests. Please try again in 20s.", "code": "rate_limit_exceeded"}, "rate_limit",
      "Rate limit exceeded (HTTP 429)"),
     (400, {"message": "The model `gpt-4o-mini` does not exist or you do not have access to it.", "code": "model_not_found"}, "unsupported",
-     "Model unavailable (HTTP 400)"),
-    (404, {"message": "Invalid URL (POST /v1/audio/transcriptions)"}, "unsupported", "Model unavailable (HTTP 404)"),
+     "Unsupported model or endpoint (HTTP 400)"),
+    (404, {"message": "Invalid URL (POST /v1/audio/transcriptions)"}, "unsupported_provider", "Provider does not support transcription (HTTP 404)"),
     (413, {"message": "Maximum content size limit exceeded."}, "too_large", "Audio upload failed (HTTP 413)"),
     (500, {"message": "The server had an error while processing your request."}, "server", "server error (HTTP 500)"),
 ]  # fmt: skip
@@ -250,7 +254,7 @@ def test_main_failure_prefers_service_problems():
     assert main_failure([TranscriptResult("no_audio", error="Video contains no audio stream.")]) is None
 
 
-@pytest.mark.parametrize(("status", "kind"), [(429, "rate_limit"), (401, "auth"), (500, "server"), (404, "unsupported")])
+@pytest.mark.parametrize(("status", "kind"), [(429, "rate_limit"), (401, "auth"), (500, "server"), (404, "unsupported_provider")])
 def test_api_errors_are_classified(tmp_path, status, kind):
     clip = tmp_path / "clip.wav"
     clip.write_bytes(b"RIFF")
@@ -473,3 +477,87 @@ def test_config_options_persist_and_normalise():
     assert (cfg.source, cfg.audio_seconds, cfg.transcript_language) == ("transcript", 600, "auto")
     assert cfg.include_filename_context and cfg.transcript_fallback and not cfg.uses_search
     assert TitleConfig().audio_seconds == 180 and TitleConfig().include_filename_context is False
+
+
+# ====================================================== provider capabilities
+GEMINI_OPENAI_LAYER = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+def test_providers_without_speech_to_text_are_never_sent_audio(ctx):
+    on_gemini = ctx.registry.add(ModelConfig.new("openai", "gemini-2.5-flash", base_url=GEMINI_OPENAI_LAYER), "AIza-key-0000000000")
+    router = ctx.registry.add(ModelConfig.new("openai_compatible", "x", base_url="https://openrouter.ai/api/v1"), "or-key-0000000000")
+    assert transcription_candidates(ctx.registry) == []
+    with pytest.raises(TranscriptionError) as auto:
+        build_transcriber(ctx.registry, AppSettings(transcription_service="auto"))
+    assert "Provider does not support transcription" in auto.value.message and "generativelanguage.googleapis.com" in auto.value.message
+    for config in (on_gemini, router):
+        with pytest.raises(TranscriptionError) as explicit:
+            build_transcriber(ctx.registry, AppSettings(transcription_service=config.id))
+        assert explicit.value.kind == "unsupported_provider"
+    real = ctx.registry.add(ModelConfig.new("openai", "gpt-4o-mini"), "sk-real-000000000000")
+    picked = build_transcriber(ctx.registry, AppSettings(transcription_service="auto"))
+    assert picked.config.id == real.id and picked.label == "OpenAI / gpt-4o-mini-transcribe (API)"
+    local = ApiTranscriber(ModelConfig.new("openai", "m", base_url="http://127.0.0.1:8000/v1"), "k", "whisper-1")
+    assert local.label == "OpenAI @ 127.0.0.1 / whisper-1 (API)"  # the label shows where the audio really goes
+
+
+def gemini_answer(text):
+    return {"candidates": [{"content": {"parts": [{"text": text}], "role": "model"}, "finishReason": "STOP"}]}
+
+
+def test_gemini_audio_understanding_is_explicit_and_sends_audio(ctx, tmp_path):
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"RIFF-audio-bytes")
+    with FakeAIServer() as srv:
+        config = ctx.registry.add(ModelConfig.new("gemini", "gemini-2.5-flash", base_url=srv.base), "AIza-secret-000000000")
+        assert gemini_candidates(ctx.registry) == [config]
+        with pytest.raises(TranscriptionError) as auto:  # Automatic never picks Gemini by itself - it points to the option
+            build_transcriber(ctx.registry, AppSettings(transcription_service="auto"))
+        assert auto.value.kind == "not_configured" and "Gemini model (audio understanding)" in auto.value.message
+        transcriber = build_transcriber(ctx.registry, AppSettings(transcription_service=config.id))
+        assert isinstance(transcriber, GeminiAudioTranscriber) and "audio understanding" in transcriber.label
+        srv.queue(200, gemini_answer(json.dumps({"speech": True, "language": "bn", "transcript": " তুমি শুক্রবার রাতে কোথায় ছিলে? "})))
+        text, language = transcriber.transcribe(clip, "bn")
+        sent = srv.requests[0]
+    assert (text, language) == ("তুমি শুক্রবার রাতে কোথায় ছিলে?", "bn")
+    assert sent["path"] == "/models/gemini-2.5-flash:generateContent" and sent["headers"]["x-goog-api-key"] == "AIza-secret-000000000"
+    assert "AIza-secret" not in sent["path"]  # the key is never in the URL
+    body = json.loads(sent["body"])
+    audio = body["contents"][0]["parts"][1]["inline_data"]
+    assert audio["mime_type"] == "audio/wav" and base64.b64decode(audio["data"]) == b"RIFF-audio-bytes"
+    assert "verbatim" in body["contents"][0]["parts"][0]["text"] and "'bn'" in body["contents"][0]["parts"][0]["text"]
+
+
+@pytest.mark.parametrize(("answer", "expected"), [
+    (gemini_answer('```json\n{"speech": true, "language": "en", "transcript": "Where were you?"}\n```'), ("ok", "Where were you?")),
+    (gemini_answer('{"speech": false, "language": "", "transcript": "[music]"}'), ("empty", "")),
+    (gemini_answer("Sure! Here is the transcript: hello"), ("invalid", "")),
+    ({"promptFeedback": {"blockReason": "SAFETY"}}, ("blocked", "")),
+    (gemini_answer(""), ("invalid", "")),
+])  # fmt: skip
+def test_gemini_answers_are_parsed_strictly(ctx, tmp_path, answer, expected):
+    video = tmp_path / "case.mp4"
+    video.write_bytes(b"x")
+    with FakeAIServer() as srv:
+        config = ctx.registry.add(ModelConfig.new("gemini", "gemini-2.5-flash", base_url=srv.base), "AIza-key-000000000")
+        srv.queue(200, answer)
+        service = TranscriptService(FakeExtractor(), GeminiAudioTranscriber(config, "AIza-key-000000000", 5), ctx.db)
+        result = service.get(video, 60)
+    status, text = expected
+    assert (result.status if result.status != "failed" else result.error_kind) == status
+    assert result.text == text  # nothing is invented when Gemini answers in the wrong format
+
+
+def test_gemini_rejects_oversized_audio_and_reports_bad_key(ctx, tmp_path):
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"0" * 14_000_001)
+    config = ModelConfig.new("gemini", "gemini-2.5-flash", base_url="http://127.0.0.1:9")
+    with pytest.raises(TranscriptionError) as big:
+        GeminiAudioTranscriber(config, "k", 5).transcribe(clip, "auto")
+    assert big.value.kind == "too_large"
+    clip.write_bytes(b"RIFF")
+    with FakeAIServer() as srv:
+        srv.queue(400, {"error": {"code": 400, "message": "API key not valid. Please pass a valid API key.", "status": "INVALID_ARGUMENT"}})
+        with pytest.raises(TranscriptionError) as auth:
+            GeminiAudioTranscriber(ModelConfig.new("gemini", "gemini-2.5-flash", base_url=srv.base), "AIza-bad", 5).transcribe(clip, "auto")
+    assert auth.value.kind == "auth" and "API authentication failed (HTTP 400)" in auth.value.message

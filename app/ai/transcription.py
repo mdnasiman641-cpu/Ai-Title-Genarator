@@ -15,8 +15,10 @@ language + backend/model, so unchanged files are never transcribed twice.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
+import json
 import threading
 import time
 import uuid
@@ -24,10 +26,11 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlparse
 
 from app.ai.errors import AIError, ErrorKind
 from app.ai.http_client import request_json
-from app.ai.model_config import ModelConfig
+from app.ai.model_config import PROVIDER_TYPES, ModelConfig
 from app.files.audio import AudioError, AudioExtractor
 from app.utils.logger import get_logger
 
@@ -83,6 +86,30 @@ def _multipart(fields: dict[str, str], file_field: str, file_path: Path) -> tupl
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
+# Services verified NOT to offer ``/audio/transcriptions`` (their OpenAI-compatible layer is chat-only).
+# Gemini's was checked live: chat/completions answers, audio/transcriptions is HTTP 404 like an unknown path.
+NO_SPEECH_TO_TEXT = {
+    "generativelanguage.googleapis.com": "Google Gemini's OpenAI-compatible API",
+    "openrouter.ai": "OpenRouter",
+    "api.deepseek.com": "DeepSeek",
+    "api.anthropic.com": "Anthropic",
+}
+MAX_GEMINI_AUDIO_BYTES = 14_000_000  # inline requests are limited to 20 MB; base64 adds a third (~7 minutes of WAV)
+
+
+def host_of(config: ModelConfig) -> str:
+    return (urlparse(config.base_url).hostname or "").lower()
+
+
+def speech_to_text_problem(config: ModelConfig) -> str | None:
+    """Why an OpenAI-style model configuration cannot transcribe (``None`` = it may)."""
+    service = NO_SPEECH_TO_TEXT.get(host_of(config))
+    if service is None:
+        return None
+    return (f"Provider does not support transcription: '{config.display_name}' uses {service} ({host_of(config)}), "
+            "which has no /audio/transcriptions endpoint.")  # fmt: skip
+
+
 _ERROR_KINDS = {
     ErrorKind.AUTH: "auth", ErrorKind.RATE_LIMIT: "rate_limit", ErrorKind.TIMEOUT: "timeout", ErrorKind.NETWORK: "network",
     ErrorKind.SERVER: "server", ErrorKind.INVALID_RESPONSE: "invalid", ErrorKind.MODEL_NOT_FOUND: "unsupported",
@@ -101,7 +128,9 @@ class ApiTranscriber(Transcriber):
 
     @property
     def label(self) -> str:
-        return f"{self.config.provider_label} / {self.model} (API)"
+        default = PROVIDER_TYPES[self.config.provider_type].default_base_url if self.config.provider_type in PROVIDER_TYPES else ""
+        where = "" if self.config.base_url == default else f" @ {host_of(self.config)}"  # show where the audio really goes
+        return f"{self.config.provider_label}{where} / {self.model} (API)"
 
     @property
     def cache_id(self) -> str:
@@ -119,7 +148,7 @@ class ApiTranscriber(Transcriber):
             data = request_json(self.label, "POST", f"{self.config.base_url}/audio/transcriptions", headers=headers,
                                 body=body, timeout=self.timeout)  # fmt: skip
         except AIError as exc:
-            error = self._explain(exc)
+            error = _explain(exc, self.config, self.model, self.timeout, endpoint="/audio/transcriptions")
             log.warning("transcription request failed: %s (HTTP %s) %s", error.kind, exc.status or "-", exc.detail)  # detail is redacted
             raise error from None
         text = data.get("text")
@@ -129,36 +158,110 @@ class ApiTranscriber(Transcriber):
         return text.strip()[:MAX_TRANSCRIPT_CHARS], detected
 
 
-    def _explain(self, exc: AIError) -> TranscriptionError:
-        """Actionable message with the HTTP status and the service's own explanation (never the key)."""
-        status = f" (HTTP {exc.status})" if exc.status else ""
-        said = f" The service said: {exc.detail}" if exc.detail else ""
-        where = f"'{self.config.display_name}' ({self.config.base_url})"
-        lowered = exc.detail.lower()
-        if exc.kind == ErrorKind.AUTH:
-            return TranscriptionError("auth", f"API authentication failed{status}.{said} Check the API key of {where} in Settings → AI → AI Models"
-                                      " (a restricted key also needs permission for audio).")  # fmt: skip
-        if exc.kind == ErrorKind.RATE_LIMIT:
-            if "quota" in lowered or "billing" in lowered or "credit" in lowered:
-                return TranscriptionError("quota", f"API quota exhausted{status}.{said} Add credit or a payment method to the account of {where}.")
-            return TranscriptionError("rate_limit", f"Rate limit exceeded{status}.{said} Wait a minute and analyse again.")
-        if exc.kind == ErrorKind.MODEL_NOT_FOUND or (exc.kind == ErrorKind.BAD_REQUEST and "model" in lowered):
-            return TranscriptionError("unsupported", f"Model unavailable{status}: '{self.model}' is not available for speech-to-text at {where}.{said}"
-                                      " Use gpt-4o-mini-transcribe, gpt-4o-transcribe or whisper-1 with OpenAI.")  # fmt: skip
-        if exc.status == 413 or "too large" in lowered or "maximum content size" in lowered:
-            return TranscriptionError("too_large", f"Audio upload failed{status}: the audio clip is too large for the service. Choose a shorter duration.")
-        if exc.kind == ErrorKind.BAD_REQUEST:
-            return TranscriptionError("unsupported", f"The transcription request was rejected{status}.{said}")
-        if exc.kind == ErrorKind.TIMEOUT:
-            return TranscriptionError("timeout", f"Network timeout{status}: no answer from {where} within {self.timeout:.0f}s."
-                                      " Try a shorter duration or a longer timeout.")  # fmt: skip
-        if exc.kind == ErrorKind.NETWORK:
-            return TranscriptionError("network", f"Audio upload failed: {where} could not be reached ({exc.detail or 'network error'}).")
-        if exc.kind == ErrorKind.SERVER:
-            return TranscriptionError("server", f"The transcription service had a server error{status}.{said} Try again shortly.")
-        if exc.kind == ErrorKind.INVALID_RESPONSE:
-            return TranscriptionError("invalid", f"Invalid API response from {where}: {exc.detail}")
-        return TranscriptionError(_ERROR_KINDS.get(exc.kind, "failed"), f"Transcription failed{status}.{said}")
+def _explain(exc: AIError, config: ModelConfig, model: str, timeout: float, *, endpoint: str) -> TranscriptionError:
+    """Actionable message with the HTTP status and the service's own explanation (never the key)."""
+    status = f" (HTTP {exc.status})" if exc.status else ""
+    said = f" The service said: {exc.detail}" if exc.detail else ""
+    where = f"'{config.display_name}' ({config.base_url})"
+    lowered = exc.detail.lower()
+    if exc.kind == ErrorKind.AUTH:
+        return TranscriptionError("auth", f"API authentication failed{status}.{said} Check the API key of {where} in Settings → AI → AI Models"
+                                  " (a restricted key also needs permission for audio).")  # fmt: skip
+    if exc.kind == ErrorKind.RATE_LIMIT:
+        if "quota" in lowered or "billing" in lowered or "credit" in lowered:
+            return TranscriptionError("quota", f"API quota exhausted{status}.{said} Add credit or a payment method to the account of {where}.")
+        return TranscriptionError("rate_limit", f"Rate limit exceeded{status}.{said} Wait a minute and analyse again.")
+    if exc.status == 404 and "model" not in lowered and endpoint == "/audio/transcriptions":
+        return TranscriptionError("unsupported_provider", f"Provider does not support transcription{status}: {where} has no {endpoint} endpoint.{said}"
+                                  " Choose an OpenAI model with an OpenAI API key, or a Gemini model (audio understanding), in Transcription service.")  # fmt: skip
+    if exc.kind == ErrorKind.MODEL_NOT_FOUND or (exc.kind == ErrorKind.BAD_REQUEST and "model" in lowered):
+        return TranscriptionError("unsupported", f"Unsupported model or endpoint{status}: '{model}' is not available for speech-to-text at {where}.{said}"
+                                  " With OpenAI use gpt-4o-mini-transcribe, gpt-4o-transcribe or whisper-1.")  # fmt: skip
+    if exc.status == 413 or "too large" in lowered or "maximum content size" in lowered or "exceeds the maximum" in lowered:
+        return TranscriptionError("too_large", f"Audio upload failed{status}: the audio clip is too large for the service. Choose a shorter duration.")
+    if exc.kind == ErrorKind.BAD_REQUEST:
+        return TranscriptionError("unsupported", f"The transcription request was rejected{status}.{said}")
+    if exc.kind == ErrorKind.TIMEOUT:
+        return TranscriptionError("timeout", f"Network timeout{status}: no answer from {where} within {timeout:.0f}s."
+                                  " Try a shorter duration or a longer timeout.")  # fmt: skip
+    if exc.kind == ErrorKind.NETWORK:
+        return TranscriptionError("network", f"Audio upload failed: {where} could not be reached ({exc.detail or 'network error'}).")
+    if exc.kind == ErrorKind.SERVER:
+        return TranscriptionError("server", f"The transcription service had a server error{status}.{said} Try again shortly.")
+    if exc.kind == ErrorKind.INVALID_RESPONSE:
+        return TranscriptionError("invalid", f"Invalid API response from {where}: {exc.detail}")
+    if exc.kind == ErrorKind.BLOCKED:
+        return TranscriptionError("blocked", f"The service declined to transcribe this audio.{said}")
+    return TranscriptionError(_ERROR_KINDS.get(exc.kind, "failed"), f"Transcription failed{status}.{said}")
+
+
+_GEMINI_PROMPT = (
+    "Transcribe the speech in this audio clip verbatim, in the language that is spoken. Do not translate, summarise, "
+    "describe sounds or music, or add anything that is not said. Answer only with JSON: "
+    '{"speech": true or false, "language": "<ISO 639-1 code or empty>", "transcript": "<the spoken words>"}. '
+    "If there is no intelligible speech, answer {\"speech\": false, \"language\": \"\", \"transcript\": \"\"}."
+)
+
+
+class GeminiAudioTranscriber(Transcriber):
+    """Gemini audio understanding: the clip is sent as audio input to ``generateContent`` of an existing Gemini model.
+
+    Google documents transcription as a supported use of audio input for Gemini models. Only chosen
+    explicitly in *Transcription service* - never as a silent substitute for a speech-to-text API.
+    """
+
+    def __init__(self, config: ModelConfig, api_key: str | None, timeout: float = 120) -> None:
+        self.config = config
+        self.api_key = api_key or ""
+        self.model = config.model_name
+        self.timeout = timeout
+
+    @property
+    def label(self) -> str:
+        return f"Gemini / {self.model} — audio understanding (API)"
+
+    @property
+    def cache_id(self) -> str:
+        return f"gemini|{self.config.base_url}|{self.model}"
+
+    def transcribe(self, audio: Path, language: str) -> tuple[str, str]:
+        data = audio.read_bytes()
+        if len(data) > MAX_GEMINI_AUDIO_BYTES:
+            raise TranscriptionError("too_large", "Audio upload failed: the clip is too large for Gemini (20 MB request limit). Choose 5 minutes or less.")
+        prompt = _GEMINI_PROMPT + (f" The speech is in the language with code '{language}'." if language and language != "auto" else "")
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}, {"inline_data": {"mime_type": "audio/wav", "data": base64.b64encode(data).decode("ascii")}}]}],
+            "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+        }  # fmt: skip
+        url = f"{self.config.base_url}/models/{quote(self.model, safe='/')}:generateContent"
+        try:
+            answer = request_json(self.label, "POST", url, headers={"x-goog-api-key": self.api_key}, payload=payload, timeout=self.timeout)
+        except AIError as exc:
+            error = _explain(exc, self.config, self.model, self.timeout, endpoint=":generateContent")
+            log.warning("gemini transcription failed: %s (HTTP %s) %s", error.kind, exc.status or "-", exc.detail)
+            raise error from None
+        return self._parse(answer, language)
+
+    def _parse(self, answer: dict[str, Any], language: str) -> tuple[str, str]:
+        candidates = answer.get("candidates") or []
+        if not candidates:
+            block = (answer.get("promptFeedback") or {}).get("blockReason")
+            raise TranscriptionError("blocked" if block else "invalid",
+                                     f"Gemini declined to transcribe this audio ({block})." if block else "Invalid API response: Gemini returned no answer.")  # fmt: skip
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        raw = "".join(str(p.get("text", "")) for p in parts if isinstance(p, dict) and not p.get("thought")).strip()
+        if not raw:
+            finish = str(candidates[0].get("finishReason", ""))
+            raise TranscriptionError("invalid", f"Invalid API response: Gemini returned an empty answer ({finish or 'no reason given'}).")
+        try:
+            result = json.loads(raw.removeprefix("```json").removesuffix("```").strip())
+        except ValueError:
+            raise TranscriptionError("invalid", "Invalid API response: Gemini did not return the requested transcript format.") from None
+        if not isinstance(result, dict) or not isinstance(result.get("transcript", ""), str):
+            raise TranscriptionError("invalid", "Invalid API response: Gemini did not return the requested transcript format.")
+        text = "" if result.get("speech") is False else str(result.get("transcript") or "")
+        detected = str(result.get("language") or (language if language != "auto" else ""))
+        return text.strip()[:MAX_TRANSCRIPT_CHARS], detected
 
 
 class LocalWhisperTranscriber(Transcriber):
@@ -200,13 +303,20 @@ class LocalWhisperTranscriber(Transcriber):
 
 
 def transcription_candidates(registry: Any) -> list[ModelConfig]:
-    """Configured models whose endpoint may offer ``/audio/transcriptions`` (OpenAI and OpenAI-compatible)."""
-    return [m for m in registry.list() if m.provider_type in ("openai", "openai_compatible") and registry.is_usable(m)]
+    """Usable OpenAI / OpenAI-compatible models whose endpoint may offer ``/audio/transcriptions``."""
+    return [m for m in registry.list() if m.provider_type in ("openai", "openai_compatible") and registry.is_usable(m)
+            and speech_to_text_problem(m) is None]  # fmt: skip
+
+
+def gemini_candidates(registry: Any) -> list[ModelConfig]:
+    """Usable Gemini models (audio understanding through ``generateContent``)."""
+    return [m for m in registry.list() if m.provider_type == "gemini" and registry.is_usable(m)]
 
 
 def build_transcriber(registry: Any, settings: Any) -> Transcriber:
     """The backend chosen in the Title Generator - never silently another one."""
     service = settings.transcription_service or AUTO_SERVICE
+    timeout = settings.transcription_timeout_s
     if service == LOCAL_SERVICE:
         if not LocalWhisperTranscriber.available():
             raise TranscriptionError("not_configured", "Local transcription is selected but 'faster-whisper' is not installed.")
@@ -214,16 +324,27 @@ def build_transcriber(registry: Any, settings: Any) -> Transcriber:
     if service == AUTO_SERVICE:
         config = next((m for m in transcription_candidates(registry) if m.provider_type == "openai"), None)
         if config is None:
+            skipped = [speech_to_text_problem(m) for m in registry.list()
+                       if m.provider_type in ("openai", "openai_compatible") and speech_to_text_problem(m)]  # fmt: skip
+            hint = " Or choose a Gemini model (audio understanding) in Transcription service." if gemini_candidates(registry) else ""
             raise TranscriptionError(
                 "not_configured",
-                "No transcription service is configured. Add an OpenAI model with its API key (Settings → AI → AI Models), "
-                "or choose an OpenAI-compatible model that offers speech-to-text in Video Content Analysis.",
+                "No speech-to-text service is configured. Add an OpenAI model with its API key (Settings → AI → AI Models), "
+                "or choose an OpenAI-compatible model that offers speech-to-text in Video Content Analysis." + hint
+                + (" " + " ".join(p for p in skipped if p) if skipped else ""),
             )
     else:
         config = registry.get(service)
         if config is None or not registry.is_usable(config):
             raise TranscriptionError("not_configured", "The selected transcription service is no longer available or has no API key.")
-    return ApiTranscriber(config, registry.api_key(config.id), settings.transcription_model, settings.transcription_timeout_s)
+        if config.provider_type == "gemini":
+            return GeminiAudioTranscriber(config, registry.api_key(config.id), timeout)
+        if config.provider_type == "custom":
+            raise TranscriptionError("unsupported_provider", f"Provider does not support transcription: '{config.display_name}' is a custom provider.")
+        problem = speech_to_text_problem(config)
+        if problem:
+            raise TranscriptionError("unsupported_provider", problem)  # refused before any audio is uploaded
+    return ApiTranscriber(config, registry.api_key(config.id), settings.transcription_model, timeout)
 
 
 # ============================================================= service + cache

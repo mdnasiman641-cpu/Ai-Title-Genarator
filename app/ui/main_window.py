@@ -36,6 +36,7 @@ from app.ai.transcription import (
     AUTO_SERVICE,
     LOCAL_SERVICE,
     LocalWhisperTranscriber,
+    gemini_candidates,
     main_failure,
     make_transcript_service,
     transcription_candidates,
@@ -701,12 +702,14 @@ class MainWindow(QMainWindow):
         settings = self.ctx.settings.load()
         options = [(tr("ca.service_auto"), AUTO_SERVICE)]
         options += [(f"{m.display_name} — {m.label} (API)", m.id) for m in transcription_candidates(self.ctx.registry)]
+        gemini = gemini_candidates(self.ctx.registry)
+        options += [(f"{m.display_name} — {tr('ca.service_gemini')}", m.id) for m in gemini]
         if LocalWhisperTranscriber.available():
             options.append((tr("ca.service_local"), LOCAL_SERVICE))
         current = settings.transcription_service
         if current not in {value for _label, value in options}:
             options.append((tr("ca.service_missing"), current))  # never switch silently - show what is selected
-        self.title_panel.content.set_services(options, current, settings.transcription_model)
+        self.title_panel.content.set_services(options, current, settings.transcription_model, fixed_model={m.id for m in gemini})
         service = make_transcript_service(self.ctx)
         text = tr("ca.backend", backend=service.label) if service.setup_error is None else service.setup_error.message
         self.title_panel.content.set_backend_text(text)

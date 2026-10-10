@@ -181,7 +181,14 @@ actually **said** in each video, not from its file name.
      The audio goes to its `/audio/transcriptions` endpoint (default model `gpt-4o-mini-transcribe`, editable, e.g. `whisper-1`). **API-based**: the audio is uploaded.
    - **A specific OpenAI / OpenAI-compatible model** from the list.
    - **Local (faster-whisper)** — offered only when the optional `faster-whisper` package is installed. **Local**: nothing is uploaded.
-   - Gemini text models are **not** used for transcription. If the chosen service is missing or unconfigured, the app says so and **never switches silently**.
+   - **A Gemini model — Gemini audio understanding** (choose it explicitly): the clip is sent as audio input to that model's `generateContent`
+     endpoint with its existing key, and Gemini is asked for a verbatim transcript (JSON; "no speech" gives an empty transcript, a wrong
+     format is rejected — nothing is invented). Up to ~7 minutes per clip. **API-based**: the audio is uploaded to Google.
+   - Providers whose OpenAI-compatible API has **no speech-to-text endpoint** (Gemini's `…/v1beta/openai`, OpenRouter, DeepSeek, Anthropic) are
+     never sent audio: *Automatic* skips them and says why, and choosing one shows *Provider does not support transcription*.
+   - *Automatic* never picks Gemini by itself. If the chosen service is missing or unconfigured, the app says so and **never switches silently**.
+   - Failures show the actual reason in the table and status bar (e.g. `Failed — API authentication failed (HTTP 401)`,
+     `API quota exhausted (HTTP 429)`, `Provider does not support transcription (HTTP 404)`, `Video contains no audio stream`); keys are never shown or logged.
 3. The transcript (trimmed if very long) goes through the normal AI router (same models, fallback, batching) with the Title Generator settings. The AI must
    separate **supported facts**, **interpretation** and **unknowns**, and may not invent events. The file name is sent only if *Include filename as additional
    context* is ticked (off by default).

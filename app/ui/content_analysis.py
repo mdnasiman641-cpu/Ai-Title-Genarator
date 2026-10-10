@@ -236,8 +236,12 @@ class ContentAnalysisPanel(QFrame):
         self.source.blockSignals(False)
         self._update()
 
-    def set_services(self, options: list[tuple[str, str]], current: str, model: str) -> None:
-        """``options``: (label, value) pairs - "auto", configured model ids, and "local" when installed."""
+    def set_services(self, options: list[tuple[str, str]], current: str, model: str, fixed_model: set[str] | None = None) -> None:
+        """``options``: (label, value) pairs - "auto", configured model ids, and "local" when installed.
+
+        ``fixed_model``: services that bring their own model (Gemini), so the model field is not used.
+        """
+        self._fixed_model = set(fixed_model or ())
         self.service.blockSignals(True)
         self.service.clear()
         for label, value in options:
@@ -262,8 +266,8 @@ class ContentAnalysisPanel(QFrame):
 
     def _update(self) -> None:
         self.custom_seconds.setEnabled(self.duration.currentData() == "custom" and not self._running)
-        is_local = self.service.currentData() == "local"
-        self.model.setEnabled(not is_local and not self._running)
+        own_model = self.service.currentData() == "local" or self.service.currentData() in getattr(self, "_fixed_model", ())
+        self.model.setEnabled(not own_model and not self._running)
 
     # ============================================================== results
     def clear_results(self) -> None:

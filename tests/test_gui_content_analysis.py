@@ -141,6 +141,20 @@ def test_service_options_never_hide_the_selection(window, ctx):
     assert ctx.settings.load().transcription_service == "missing-model" and combo.currentData() == "missing-model"
 
 
+def test_gemini_and_unsupported_providers_in_service_list(window, ctx):
+    content = window.title_panel.content
+    on_gemini = ctx.registry.add(ModelConfig.new("openai", "gemini-2.5-flash", base_url="https://generativelanguage.googleapis.com/v1beta/openai"),
+                                 "AIza-test-0000000000")  # fmt: skip
+    gemini = ctx.registry.add(ModelConfig.new("gemini", "gemini-2.5-flash"), "AIza-test-0000000000")
+    window.refresh_models_ui()
+    assert content.service.findData(on_gemini.id) < 0  # no speech-to-text endpoint: not offered
+    assert "Provider does not support transcription" in content.backend_label.text()  # Automatic explains why
+    assert "Gemini audio understanding" in content.service.itemText(content.service.findData(gemini.id))
+    pick(content.service, gemini.id)
+    assert ctx.settings.load().transcription_service == gemini.id and not content.model.isEnabled()
+    assert content.backend_label.text() == "Transcription: Gemini / gemini-2.5-flash — audio understanding (API)"
+
+
 def test_analyze_selected_videos_in_background(window, ctx, workspace, monkeypatch):
     service = fake_service(monkeypatch, ctx)
     load(window, workspace, "case.mp4", "clip_silent.mp4", "family.mp4", "x_broken.mp4")

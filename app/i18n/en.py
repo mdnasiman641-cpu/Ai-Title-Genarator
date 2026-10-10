@@ -603,6 +603,7 @@ STRINGS: dict[str, str] = {
     "ca.service": "Transcription service",
     "ca.service_auto": "Automatic (first OpenAI model)",
     "ca.service_local": "faster-whisper (local, on this PC)",
+    "ca.service_gemini": "Gemini audio understanding (API, sends the audio clip to Google)",
     "ca.service_missing": "Selected service is not available",
     "ca.backend": "Transcription: {backend}",
     "ca.model_ph": "gpt-4o-mini-transcribe",
