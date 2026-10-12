@@ -23,6 +23,8 @@ review a colour-coded **preview**, click **Apply**, and can **Undo** the whole b
 10. [Tests](#tests) · [Project layout](#project-layout) · [Extending](#extending-the-app) · [Troubleshooting](#troubleshooting)
 
 ## Quick start
+**Download:** [Latest release](https://github.com/mdnasiman641-cpu/Ai-Title-Genarator/releases/latest) → `AI-Video-File-Assistant-windows.zip` → extract it → run **AI Video File Assistant.exe** inside the extracted folder (keep the other files next to it). Every successful build of `main` publishes a new release automatically.
+
 1. Start **AI Video File Assistant.exe**. On first start click **Add Model** in the welcome banner (or *Settings → AI → AI Models → Add Model*),
    pick a provider type, paste the API key, choose a model (or **Load Models**), press **Test Connection**, then **Save**.
 2. **Browse** (or drag & drop a folder). 3. Type a command, pick the **AI mode** (default *Auto + Fallback*) and **Model** (default *Automatic*),

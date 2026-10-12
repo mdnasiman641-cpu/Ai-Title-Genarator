@@ -1,6 +1,8 @@
 name: Windows build
 
 # Builds and tests the desktop app on a real Windows runner and uploads the .exe as an artifact.
+# Every successful build of main is also published as a GitHub Release (a .zip with the .exe):
+#   https://github.com/<owner>/<repo>/releases/latest
 # Manual run:  Actions -> "Windows build" -> Run workflow.
 on:
   workflow_dispatch:
@@ -11,6 +13,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write  # needed to publish the Release
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,3 +29,17 @@ jobs:
           name: AI-Video-File-Assistant-windows
           path: dist/AI Video File Assistant
           if-no-files-found: error
+      - name: Zip the app for the Release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/AI Video File Assistant" -DestinationPath "AI-Video-File-Assistant-windows.zip"
+      - name: Publish the Release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Select-String -Path app/config/constants.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          $tag = "v$version-build.${{ github.run_number }}"
+          $notes = "Windows build of commit ${{ github.sha }}.`n`nDownload **AI-Video-File-Assistant-windows.zip**, extract it, and run **AI Video File Assistant.exe** inside the extracted folder (keep the files next to it)."
+          gh release create $tag "AI-Video-File-Assistant-windows.zip" --target "${{ github.sha }}" --title "AI Video File Assistant $version (build ${{ github.run_number }})" --notes $notes --latest
