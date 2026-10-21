@@ -191,6 +191,7 @@ def test_test_connection_in_form(form):
         assert "gpt-4o-mini" in dlg.result_label.text() and "seconds" in dlg.result_label.text()
         assert srv.requests[0]["headers"]["authorization"] == f"Bearer {KEY}"
         srv.queue(401, {"error": {"message": "Incorrect API key provided"}})
+        assert wait_until(dlg.test_button.isEnabled)  # the result is shown just before the button is re-enabled
         dlg.test_button.click()
         assert wait_until(lambda: dlg.result_label.text().startswith("✗"))
         assert "Authentication" in dlg.result_label.text() and KEY not in dlg.result_label.text()
