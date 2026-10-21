@@ -356,6 +356,23 @@ _LOADED_MODELS: dict[tuple[str, str], Any] = {}  # loaded once per app run, shar
 _LOAD_LOCK = threading.Lock()
 
 
+def _wav_samples(path: Path) -> Any:
+    """16-bit mono 16 kHz WAV -> float32 samples in [-1, 1] (what Whisper expects).
+
+    Passing samples instead of a file name keeps faster-whisper away from its own PyAV-based decoder,
+    which breaks with newer PyAV releases ("open() got an unexpected keyword argument 'metadata_errors'").
+    """
+    import wave
+
+    import numpy as np
+
+    with wave.open(str(path), "rb") as clip:
+        if clip.getnchannels() != 1 or clip.getsampwidth() != 2 or clip.getframerate() != 16_000:
+            raise TranscriptionError("failed", "Internal error: the extracted audio is not 16 kHz mono 16-bit WAV.")
+        frames = clip.readframes(clip.getnframes())
+    return np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+
+
 def whisper_models_dir() -> Path:
     from app.utils.helpers import get_app_data_dir
 
@@ -443,7 +460,8 @@ class LocalWhisperTranscriber(Transcriber):
     def transcribe(self, audio: Path, language: str) -> Speech:
         model = self._model()
         try:
-            segments, info = model.transcribe(str(audio), language=None if language in ("", "auto") else language, beam_size=5,
+            samples = _wav_samples(audio)  # our clip is already 16 kHz mono - faster-whisper's own decoder is not needed
+            segments, info = model.transcribe(samples, language=None if language in ("", "auto") else language, beam_size=5,
                                               vad_filter=True, condition_on_previous_text=False)  # fmt: skip
             kept = [Segment(round(seg.start, 2), round(seg.end, 2), seg.text.strip()) for seg in segments if _is_speech(seg)]
         except Exception as exc:  # noqa: BLE001 - third-party engine: report, never crash

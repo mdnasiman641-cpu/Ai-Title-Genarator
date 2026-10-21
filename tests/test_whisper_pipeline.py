@@ -140,6 +140,8 @@ class FakeWhisperModel:
         FakeWhisperModel.loads.append((name, device))
 
     def transcribe(self, audio, language=None, **kw):  # noqa: ANN001
+        # samples, never a file: faster-whisper's own decoder breaks with newer PyAV ("metadata_errors")
+        assert not isinstance(audio, (str, Path)) and audio.dtype.name == "float32"
         seg = lambda s, e, t, nsp=0.01, lp=-0.2: types.SimpleNamespace(start=s, end=e, text=t, no_speech_prob=nsp, avg_logprob=lp, compression_ratio=1.2)  # noqa: E731
         segments = [seg(0.0, 4.2, " And so, my fellow Americans,"), seg(4.2, 11.0, " ask not what your country can do for you."),
                     seg(11.0, 30.0, " Thank you.", nsp=0.9, lp=-1.5)]  # fmt: skip
@@ -158,6 +160,7 @@ def fake_whisper(monkeypatch, tmp_path):
     monkeypatch.setattr("ctranslate2.get_cuda_device_count", lambda: 1)  # pretend a GPU: the CPU must take over
     monkeypatch.setattr(transcription, "_LOADED_MODELS", {})
     monkeypatch.setattr(LocalWhisperTranscriber, "model_downloaded", lambda self: bool(FakeWhisperModel.loads))
+    monkeypatch.setattr(transcription, "_wav_samples", lambda path: __import__("numpy").zeros(16000, dtype="float32"))
     return tmp_path / "models"
 
 
@@ -208,6 +211,17 @@ def test_model_download_failure_is_reported_once_per_batch(monkeypatch, ctx, tmp
     first, second = service.get(tmp_path / "a.mp4", 180), service.get(tmp_path / "b.mp4", 180)
     assert first.error_kind == second.error_kind == "model_download" and len(attempts) == 1
     assert "could not be downloaded" in first.error and "484 MB" in first.error and first.stage == "transcribe"
+
+
+@pytest.mark.skipif(not _extractors(), reason="no audio decoder")
+def test_extracted_clip_becomes_whisper_samples():
+    np = pytest.importorskip("numpy")
+    from app.ai.transcription import _wav_samples
+
+    with _extractors()[0][1].extracted_audio(JFK, 180) as clip:
+        samples = _wav_samples(clip.path)
+    assert samples.dtype == np.float32 and abs(len(samples) / 16000 - 11.0) < 0.1
+    assert 0.05 < float(np.abs(samples).max()) <= 1.0  # real speech, correctly scaled
 
 
 # ============================================================== Whisper API

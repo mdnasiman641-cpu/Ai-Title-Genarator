@@ -163,6 +163,10 @@ def gui_checks(ctx, work: Path, transcript: str, model: str) -> None:  # type: i
         rejected = [t for t in texts if "Lincoln" in t and " — " in t]
         check("invented claims rejected (made-up quote, made-up name)", len(rejected) == 2
               and any("'Lincoln' is not mentioned in the transcript" in t for t in rejected), " | ".join(rejected))  # fmt: skip
+        if not new_name:
+            check("apply / undo with a chosen suggestion", False, "skipped: there is no preview row")
+            window.close()
+            return
         window.use_suggestion("clip_0001.mp4", second["title"])
         new_name = model_rows.index(0, COL_NEW).data()
         check("choosing another suggestion updates the preview", new_name == f"{second['title'].replace(',', ',')}.mp4"
