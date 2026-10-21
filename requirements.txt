@@ -3,3 +3,10 @@
 # so no vendor SDKs are needed. PySide6-Essentials is the Qt for Python subset the
 # app uses (Core, Gui, Widgets, Svg) - smaller than the full PySide6 meta package.
 PySide6-Essentials==6.11.2
+# Local Whisper speech-to-text (Title Generator "Video Audio / Transcript"): faster-whisper runs
+# OpenAI's Whisper model on the CPU (or a CUDA GPU) via CTranslate2. PyAV brings FFmpeg's decoders,
+# so audio can be extracted even without an ffmpeg program. The model itself is downloaded on first use.
+faster-whisper==1.2.1
+ctranslate2==4.8.3
+av==19.0.2
+onnxruntime==1.31.0

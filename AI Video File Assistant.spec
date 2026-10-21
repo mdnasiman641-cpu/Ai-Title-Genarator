@@ -13,6 +13,8 @@ import os
 import sys
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+
 ROOT = Path(SPECPATH)  # noqa: F821 - provided by PyInstaller
 NAME = "AI Video File Assistant"
 ONEFILE = os.environ.get("AIVFA_ONEFILE") == "1"
@@ -27,6 +29,10 @@ datas = [
 bin_dir = ROOT / "app" / "resources" / "bin"  # optional: drop ffmpeg.exe / ffprobe.exe here
 if not ONEFILE and bin_dir.is_dir() and any(p.suffix.lower() in (".exe", ".dll") for p in bin_dir.iterdir()):
     datas.append((str(bin_dir), "app/resources/bin"))
+
+# Local Whisper: faster-whisper's voice-activity model (assets/*.onnx) and CTranslate2's native libraries.
+datas += collect_data_files("faster_whisper")
+binaries = collect_dynamic_libs("ctranslate2")
 
 icon_file = ROOT / "app" / "resources" / "icons" / "app.ico"
 version_file = ROOT / "version_info.txt"
@@ -44,7 +50,8 @@ a = Analysis(  # noqa: F821
     [str(ROOT / "main.py")],
     pathex=[str(ROOT)],
     datas=datas,
-    hiddenimports=[],
+    binaries=binaries,
+    hiddenimports=["faster_whisper", "ctranslate2", "av", "onnxruntime"],  # imported lazily (only when transcribing)
     excludes=["tkinter", "unittest", "pytest", "_pytest", "pip", "setuptools", "wheel", "distutils", "pydoc_data"],
     noarchive=False,
 )

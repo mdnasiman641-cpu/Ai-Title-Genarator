@@ -23,6 +23,31 @@ jobs:
       - name: Build (runs the tests, PyInstaller, and the exe self-test)
         shell: cmd
         run: build.bat
+      - name: Real Whisper check - Python pipeline, Bangla and GUI (downloads Whisper models)
+        shell: cmd
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: utf-8
+        run: .venv\Scripts\python tools\verify_whisper.py --model small --bangla-model large-v3-turbo --data-dir "%RUNNER_TEMP%\aivfa-data" --report whisper-report.json
+      - name: Real Whisper check - the built .exe transcribes real speech
+        shell: pwsh
+        run: |
+          $env:AIVFA_DATA_DIR = "$env:RUNNER_TEMP\aivfa-data"
+          $exe = "dist\AI Video File Assistant\AI Video File Assistant.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList "--transcribe", "tests\data\jfk_speech.mp4", "--out", "exe-transcript.json" -Wait -PassThru
+          Get-Content exe-transcript.json -Encoding utf8
+          $report = Get-Content exe-transcript.json -Encoding utf8 | ConvertFrom-Json
+          if ($p.ExitCode -ne 0 -or $report.status -ne "ok" -or $report.text -notmatch "country") { throw "the built exe did not transcribe the speech (exit $($p.ExitCode), status $($report.status))" }
+      - name: Upload the Whisper reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-verification
+          path: |
+            whisper-report.json
+            exe-transcript.json
+          if-no-files-found: ignore
       - name: Upload the one-folder build
         uses: actions/upload-artifact@v4
         with:

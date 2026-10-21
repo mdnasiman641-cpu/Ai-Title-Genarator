@@ -62,9 +62,11 @@ class AppSettings:
     search_endpoint: str = GOOGLE_SEARCH_ENDPOINT
     search_cache_hours: int = 24
     # --- Video audio transcription (Title Generator "Video Audio / Transcript")
-    transcription_service: str = "auto"  # "auto" (first OpenAI model), a model configuration id, or "local"
-    transcription_model: str = "gpt-4o-mini-transcribe"
+    transcription_service: str = "auto"  # "auto" (local Whisper, else the first OpenAI model), a model configuration id, or "local"
+    transcription_model: str = "whisper-1"  # model for the Whisper API
     transcription_timeout_s: int = 120
+    whisper_model: str = "small"  # local Whisper model (tiny / base / small / medium / large-v3-turbo / large-v3)
+    whisper_device: str = "auto"  # auto (GPU only when CUDA works) / cpu / cuda
     # --- File operations
     ask_before_apply: bool = True
     create_history: bool = True
@@ -104,7 +106,10 @@ class AppSettings:
         out.request_timeout_s = max(5, min(int(out.request_timeout_s), 600))
         out.search_cache_hours = max(0, min(int(out.search_cache_hours), 720))
         out.transcription_service = out.transcription_service.strip() or "auto"
-        out.transcription_model = out.transcription_model.strip()[:120] or "gpt-4o-mini-transcribe"
+        model = out.transcription_model.strip()[:120]
+        out.transcription_model = "whisper-1" if model in ("", "gpt-4o-mini-transcribe") else model  # old default -> Whisper
+        out.whisper_model = out.whisper_model.strip()[:200] or "small"
+        out.whisper_device = out.whisper_device if out.whisper_device in ("auto", "cpu", "cuda") else "auto"
         out.transcription_timeout_s = max(10, min(int(out.transcription_timeout_s), 900))
         out.search_endpoint = out.search_endpoint.strip() or GOOGLE_SEARCH_ENDPOINT
         out.search_engine_id = out.search_engine_id.strip()[:120]

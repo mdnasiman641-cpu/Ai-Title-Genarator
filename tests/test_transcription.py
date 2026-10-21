@@ -14,10 +14,12 @@ from pathlib import Path
 
 import pytest
 
+from app.ai.base_provider import AIResponse
 from app.ai.model_config import ModelConfig
 from app.ai.pipeline import PipelineCancelled, PipelineError, PipelineRequest, run_pipeline
 from app.ai.title_config import TitleConfig
 from app.ai.title_generator import MAX_TRANSCRIPT_PROMPT_CHARS, _trim_transcript
+from app.ai.title_quality import STOPWORDS, words
 from app.ai.transcription import (
     ApiTranscriber,
     GeminiAudioTranscriber,
@@ -35,10 +37,11 @@ from app.ai.transcription import (
 from app.config.constants import ProcessingMode
 from app.config.settings import AppSettings
 from app.context import AppContext
+from app.files import audio as audio_module
 from app.files.audio import AudioClip, AudioError, AudioExtractor
 from app.files.scanner import scan_folder
 from tests.fake_ai_server import FakeAIServer
-from tests.test_title_generator import TitleModel
+from tests.test_title_generator import TitleModel, distinct_title
 
 FFMPEG = shutil.which("ffmpeg")
 needs_ffmpeg = pytest.mark.skipif(FFMPEG is None, reason="ffmpeg not installed")
@@ -54,6 +57,30 @@ def ctx(tmp_path):
 
 
 # =============================================================== fakes
+class TranscriptModel(TitleModel):
+    """A well-behaved AI: for transcript items it returns an analysis and 5 suggestions grounded in the transcript."""
+
+    def generate(self, request):
+        if self.script:
+            return super().generate(request)
+        payload = json.loads(request.user_prompt.split("\n", 1)[1])
+        self.requests.append(payload)
+        out = []
+        for item in payload["items"]:
+            if "transcript" not in item:
+                self.counter += 1
+                out.append({"n": item["n"], "title": distinct_title(1000 + self.counter, self.words)})
+                continue
+            said = [w for w in words(item["transcript"]) if w not in STOPWORDS and len(w) > 3]
+            suggestions = []
+            for k in range(5):
+                self.counter += 1
+                suggestions.append({"title": f"{distinct_title(1000 + self.counter, self.words - 1)} {said[k % len(said)]}",
+                                    "evidence": " ".join(item["transcript"].split()[:3]), "names": []})  # fmt: skip
+            out.append({"n": item["n"], "analysis": {"topic": said[0], "key_points": said[:2]}, "suggestions": suggestions})
+        return AIResponse(json.dumps({"titles": out}), self.id, self.model)
+
+
 class FakeExtractor:
     """Stands in for ffmpeg: names containing 'silent' have no audio, 'broken' cannot be read."""
 
@@ -176,6 +203,7 @@ def test_missing_ffmpeg_is_reported(tmp_path, monkeypatch):
     from app.files import metadata
 
     monkeypatch.setattr(metadata, "find_binary", lambda *a, **k: None)
+    monkeypatch.setattr(audio_module, "pyav_available", lambda: False)  # no built-in decoder either
     extractor = AudioExtractor()
     with pytest.raises(AudioError) as err, extractor.extracted_audio(tmp_path / "x.mp4", 30):
         pass
@@ -189,7 +217,8 @@ def test_api_transcriber_uploads_audio_only(tmp_path):
     with FakeAIServer() as srv:
         srv.queue(200, {"text": "  Where were you on Friday night?  ", "language": "en"})
         config = ModelConfig.new("openai", "gpt-4o-mini", base_url=srv.base)
-        text, language = ApiTranscriber(config, "sk-test-key-0000000000", "gpt-4o-mini-transcribe", 5).transcribe(clip, "en")
+        speech = ApiTranscriber(config, "sk-test-key-0000000000", "gpt-4o-mini-transcribe", 5).transcribe(clip, "en")
+        text, language = speech.text, speech.language
     sent = srv.requests[0]
     assert (text, language) == ("Where were you on Friday night?", "en")
     assert sent["path"] == "/audio/transcriptions" and sent["headers"]["authorization"] == "Bearer sk-test-key-0000000000"
@@ -391,7 +420,7 @@ def test_include_filename_as_context_option(workspace, router_for, ctx):
 
 def test_failed_videos_are_skipped_never_invented(workspace, router_for, ctx):
     entries = files(workspace, "case.mp4", "silent.mp4", "broken.mp4")
-    model = TitleModel(words=8)
+    model = TranscriptModel(words=8)
     service = TranscriptService(FakeExtractor(), FakeTranscriber(), ctx.db)
     result = run_pipeline(request(workspace, entries, transcript_cfg(), service), router_for(model))
     sent = model.requests[0]["items"]
@@ -405,7 +434,7 @@ def test_failed_videos_are_skipped_never_invented(workspace, router_for, ctx):
 
 def test_explicit_fallback_is_clearly_labelled(workspace, router_for, ctx):
     entries = files(workspace, "case.mp4", "silent.mp4")
-    model = TitleModel(words=8)
+    model = TranscriptModel(words=8)
     service = TranscriptService(FakeExtractor(), FakeTranscriber(), ctx.db)
     result = run_pipeline(request(workspace, entries, transcript_cfg(transcript_fallback=True), service), router_for(model))
     items = {i["n"]: i for i in model.requests[0]["items"]}
@@ -427,25 +456,31 @@ def test_nothing_transcribed_stops_with_explanation(workspace, router_for, ctx):
 def test_batch_of_50_reuses_cache_and_keeps_requests_small(workspace, router_for, ctx):
     entries = files(workspace, *[f"clip{i:02d}.mp4" for i in range(50)])
     transcriber = FakeTranscriber(texts={})
-    model = TitleModel(words=8)
+    model = TranscriptModel(words=8)
     result = run_pipeline(request(workspace, entries, transcript_cfg(), TranscriptService(FakeExtractor(), transcriber, ctx.db)),
                           router_for(model))  # fmt: skip
-    assert len(transcriber.calls) == 50 and len(model.requests) == 7  # 8 transcripts per request
+    assert len(transcriber.calls) == 50 and len(model.requests) == 13  # 4 transcripts (x 5 suggestions) per request, no top-up
     assert len({op.target for op in result.plan.ops}) == 50 and result.plan.counts()["applicable"] == 50
-    model2 = TitleModel(words=8)
+    model2 = TranscriptModel(words=8)
     run_pipeline(request(workspace, entries, transcript_cfg(), TranscriptService(FakeExtractor(), transcriber, ctx.db)),
                  router_for(model2))  # fmt: skip
     assert len(transcriber.calls) == 50  # second run: every transcript came from the cache
 
 
-def test_duplicates_are_regenerated_with_their_transcripts(workspace, router_for, ctx):
+def test_duplicate_titles_switch_to_another_valid_suggestion(workspace, router_for, ctx):
     entries = files(workspace, "case.mp4", "family.mp4")
-    same = lambda p: {"titles": [{"n": i["n"], "title": "Two People Argue About Something Important Tonight"} for i in p["items"]]}  # noqa: E731
-    model = TitleModel(script=[same], words=8)
-    service = TranscriptService(FakeExtractor(), FakeTranscriber(), ctx.db)
-    run_pipeline(request(workspace, entries, transcript_cfg(), service), router_for(model))
-    regen = model.requests[1]
-    assert [i["n"] for i in regen["items"]] == [2] and "transcript" in regen["items"][0]
+    texts = {"case.mp4": "Detective: the old car was found at the docks last night, and nobody saw the driver.",
+             "family.mp4": "Mother: the old car belonged to your grandfather, and he never let anyone drive it."}  # fmt: skip
+    same = {"title": "The Old Car Everyone Keeps Talking About Tonight", "evidence": "the old car", "names": []}
+    first = lambda p: {"titles": [{"n": i["n"], "suggestions": [same]} for i in p["items"]]}  # noqa: E731
+    model = TranscriptModel(script=[first], words=8)
+    service = TranscriptService(FakeExtractor(), FakeTranscriber(texts=texts), ctx.db)
+    result = run_pipeline(request(workspace, entries, transcript_cfg(), service), router_for(model))
+    targets = [op.target for op in result.plan.ops]
+    assert len(set(targets)) == 2  # the duplicate was replaced by another suggestion validated for that video
+    top_up = model.requests[1]  # one extra request for more suggestions - with the transcripts
+    assert top_up["task"].startswith("write additional") and all("transcript" in i for i in top_up["items"])
+    assert len(model.requests) == 2  # no further regeneration requests were needed
 
 
 def test_progress_and_cancel(workspace, router_for, ctx):
@@ -496,7 +531,7 @@ def test_providers_without_speech_to_text_are_never_sent_audio(ctx):
         assert explicit.value.kind == "unsupported_provider"
     real = ctx.registry.add(ModelConfig.new("openai", "gpt-4o-mini"), "sk-real-000000000000")
     picked = build_transcriber(ctx.registry, AppSettings(transcription_service="auto"))
-    assert picked.config.id == real.id and picked.label == "OpenAI / gpt-4o-mini-transcribe (API)"
+    assert picked.config.id == real.id and picked.label == "OpenAI / whisper-1 (API)"
     local = ApiTranscriber(ModelConfig.new("openai", "m", base_url="http://127.0.0.1:8000/v1"), "k", "whisper-1")
     assert local.label == "OpenAI @ 127.0.0.1 / whisper-1 (API)"  # the label shows where the audio really goes
 
@@ -517,7 +552,8 @@ def test_gemini_audio_understanding_is_explicit_and_sends_audio(ctx, tmp_path):
         transcriber = build_transcriber(ctx.registry, AppSettings(transcription_service=config.id))
         assert isinstance(transcriber, GeminiAudioTranscriber) and "audio understanding" in transcriber.label
         srv.queue(200, gemini_answer(json.dumps({"speech": True, "language": "bn", "transcript": " তুমি শুক্রবার রাতে কোথায় ছিলে? "})))
-        text, language = transcriber.transcribe(clip, "bn")
+        speech = transcriber.transcribe(clip, "bn")
+        text, language = speech.text, speech.language
         sent = srv.requests[0]
     assert (text, language) == ("তুমি শুক্রবার রাতে কোথায় ছিলে?", "bn")
     assert sent["path"] == "/models/gemini-2.5-flash:generateContent" and sent["headers"]["x-goog-api-key"] == "AIza-secret-000000000"
@@ -529,7 +565,7 @@ def test_gemini_audio_understanding_is_explicit_and_sends_audio(ctx, tmp_path):
 
 
 @pytest.mark.parametrize(("answer", "expected"), [
-    (gemini_answer('```json\n{"speech": true, "language": "en", "transcript": "Where were you?"}\n```'), ("ok", "Where were you?")),
+    (gemini_answer('```json\n{"speech": true, "language": "en", "transcript": "Where were you on Friday night?"}\n```'), ("ok", "Where were you on Friday night?")),
     (gemini_answer('{"speech": false, "language": "", "transcript": "[music]"}'), ("empty", "")),
     (gemini_answer("Sure! Here is the transcript: hello"), ("invalid", "")),
     ({"promptFeedback": {"blockReason": "SAFETY"}}, ("blocked", "")),

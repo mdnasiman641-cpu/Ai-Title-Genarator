@@ -188,8 +188,8 @@ def test_failures_show_the_actual_reason(window, ctx, workspace, monkeypatch):
     window.analyze_videos()
     assert wait_until(lambda: window._analysis_worker is None, timeout=8)
     rows = {content.results.topLevelItem(i).text(0): content.results.topLevelItem(i) for i in range(3)}
-    assert rows["case.mp4"].text(COL_TRANSCRIPT) == "Failed — API authentication failed (HTTP 401)"
-    assert rows["a_broken.mp4"].text(COL_TRANSCRIPT).startswith("Failed — Audio extraction failed")
+    assert rows["case.mp4"].text(COL_TRANSCRIPT) == "Failed (transcription) — API authentication failed (HTTP 401)"
+    assert rows["a_broken.mp4"].text(COL_TRANSCRIPT).startswith("Failed (audio extraction) — Audio extraction failed")
     assert rows["case.mp4"].isExpanded() and "Incorrect API key provided" in rows["case.mp4"].child(0).text(0)
     assert content.counts() == (0, 3, 0)
     # the status bar names the reason shared by most videos, not the first file's
@@ -206,7 +206,9 @@ def test_cancel_analysis(window, ctx, workspace, monkeypatch):
     assert wait_until(lambda: content.results.topLevelItemCount() >= 1, timeout=5)
     content.analyze_button.click()  # the same button cancels
     assert wait_until(lambda: window._analysis_worker is None, timeout=8)
-    assert content.results.topLevelItemCount() < 8 and "cancel" in window.status_label.text().lower()
+    states = [content.results.topLevelItem(i).text(COL_TRANSCRIPT) for i in range(8)]
+    assert "Not processed (cancelled)" in states and "cancel" in window.status_label.text().lower()  # stopped before the rest
+    assert any(s.startswith("Completed") for s in states) and not any(s.startswith(("Waiting", "Transcribing")) for s in states)
     assert content.analyze_button.text() == "Analyze Selected Videos"
 
 
@@ -243,3 +245,64 @@ def test_transcript_based_preview(window, ctx, workspace, monkeypatch):
     row = next(tp.content.results.topLevelItem(i) for i in range(tp.content.results.topLevelItemCount())
                if tp.content.results.topLevelItem(i).text(0) == "case.mp4")  # fmt: skip
     assert row.text(COL_TITLE).startswith("A Witness's Alibi")
+
+
+def test_suggestions_can_be_chosen_into_the_preview_then_applied_and_undone(window, ctx, workspace, monkeypatch):
+    fake_service(monkeypatch, ctx)
+    load(window, workspace, "case.mp4")
+    suggestions = [
+        {"title": "A Car Seen At The Docks Breaks A Friday Alibi", "evidence": "your car was seen at the docks"},
+        {"title": "Detective Morgan Cracks The Docks Case", "evidence": "at the docks", "names": ["Morgan"]},  # invented name
+        {"title": "Where Were You On Friday Night", "evidence": "where were you on friday night"},
+    ]  # fmt: skip
+    answer = {"titles": [{"n": 1, "analysis": {"topic": "an alibi", "hook": "the car at the docks"}, "suggestions": suggestions}]}
+    with FakeAIServer() as srv:
+        ctx.registry.add(ModelConfig.new("openai_compatible", "local-model", base_url=srv.base, max_retries=0))
+        window.refresh_models_ui()
+        tp = window.title_panel
+        tp.enabled.setChecked(True)
+        pick(tp.source, "transcript")
+        pick(tp.capacity, "custom")
+        tp.min_words.setValue(4)
+        tp.max_words.setValue(14)
+        for _ in range(2):
+            srv.queue(200, openai_ok(json.dumps(answer)))
+        window.command_panel.set_command("")
+        window.generate_preview()
+        assert tp.content.results.topLevelItem(0).text(COL_TRANSCRIPT) == "Analyzing transcript & generating titles…"  # live stage
+        assert wait_until(lambda: window._plan_worker is None and not window.command_panel._busy, timeout=8)
+    content = tp.content
+    assert content.suggestions_for("case.mp4") == [suggestions[0]["title"], suggestions[2]["title"]]  # Morgan rejected
+    model = window.preview_panel.model
+    assert model.index(0, COL_NEW).data() == f"{suggestions[0]['title']}.mp4"
+    row = content.results.topLevelItem(0)
+    group = next(row.child(i) for i in range(row.childCount()) if row.child(i).text(0).startswith("Title suggestions"))
+    assert group.child(0).text(0).startswith("✓ ")  # the one in the preview is ticked
+    content.results.setCurrentItem(group.child(1))
+    assert content.use_button.isEnabled()
+    content.use_button.click()  # nothing is renamed yet - only the preview changes
+    assert model.index(0, COL_NEW).data() == "Where Were You On Friday Night.mp4" and (workspace / "case.mp4").exists()
+    assert group.child(1).text(0).startswith("✓ ") and not group.child(0).text(0).startswith("✓ ")
+    window.apply_changes()
+    assert wait_until(lambda: (workspace / "Where Were You On Friday Night.mp4").exists() and not window._operation_running)
+    window.undo_last()
+    assert wait_until(lambda: (workspace / "case.mp4").exists() and not window._operation_running)
+
+
+def test_choosing_a_title_without_a_preview_explains_what_to_do(window):
+    window.use_suggestion("case.mp4", "Any Title")
+    assert "Generate Preview first" in window.status_label.text()
+
+
+@pytest.mark.local_whisper
+def test_local_whisper_model_picker(window, ctx, monkeypatch):
+    monkeypatch.setattr(LocalWhisperTranscriber, "available", staticmethod(lambda: True))
+    window.refresh_models_ui()
+    content = window.title_panel.content
+    assert content.service.currentData() == AUTO_SERVICE and not content.whisper_model.isHidden()
+    assert content.model.isHidden()  # the API model field is replaced by the Whisper model choice
+    assert content.backend_label.text() == "Transcription: Whisper small (local, faster-whisper)"
+    content.whisper_model.setCurrentIndex(content.whisper_model.findData("large-v3-turbo"))
+    content.whisper_model.activated.emit(content.whisper_model.currentIndex())
+    assert ctx.settings.load().whisper_model == "large-v3-turbo"
+    assert content.backend_label.text() == "Transcription: Whisper large-v3-turbo (local, faster-whisper)"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from app.ai.ai_router import ModelRouter, make_router
 from app.ai.pipeline import PipelineRequest, PipelineResult
 from app.ai.task_analyzer import analyze_task
 from app.ai.title_config import load_current, save_current
+from app.ai.title_generator import clean_title, compose_name
 from app.ai.transcription import (
     AUTO_SERVICE,
     LOCAL_SERVICE,
@@ -47,6 +49,7 @@ from app.context import AppContext
 from app.database.models import CommandRecord, SavedPrompt
 from app.files.metadata import MetadataProbe, VideoMetadata
 from app.files.operation_manager import ExecutionResult, OperationManager, UndoResult
+from app.files.path_validator import PathError, WorkspacePaths
 from app.files.plan import OpKind, Plan
 from app.files.scanner import FileEntry, ScanResult
 from app.files.thumbnails import ThumbnailCache
@@ -184,6 +187,8 @@ class MainWindow(QMainWindow):
         content.cancel_requested.connect(self.cancel_analysis)
         content.clear_cache_requested.connect(self.clear_transcript_cache)
         content.service_changed.connect(self._on_transcription_service_changed)
+        content.whisper_model_changed.connect(self._on_whisper_model_changed)
+        content.suggestion_chosen.connect(self.use_suggestion)
         self._analysis_worker: TranscriptionWorker | None = None
         self.command_panel.generate_requested.connect(self.generate_preview)
         self.command_panel.cancel_requested.connect(self.cancel_planning)
@@ -632,6 +637,9 @@ class MainWindow(QMainWindow):
             search=make_search_service(self.ctx) if title_config.enabled and title_config.uses_search else None,
             transcripts=make_transcript_service(self.ctx) if title_config.enabled and title_config.source == "transcript" else None,
         )  # fmt: skip
+        if title_config.enabled and title_config.source == "transcript":
+            for entry in files:  # live status in Video Content Analysis until the reports arrive
+                self.title_panel.content.set_stage(entry.rel_path, "analyze")
         self._plan_generation += 1
         generation = self._plan_generation
         self._active_command = command or tr("tg.history_command", count=len(files))
@@ -709,10 +717,41 @@ class MainWindow(QMainWindow):
         current = settings.transcription_service
         if current not in {value for _label, value in options}:
             options.append((tr("ca.service_missing"), current))  # never switch silently - show what is selected
-        self.title_panel.content.set_services(options, current, settings.transcription_model, fixed_model={m.id for m in gemini})
+        local = {LOCAL_SERVICE} | ({AUTO_SERVICE} if LocalWhisperTranscriber.available() else set())
+        self.title_panel.content.set_services(options, current, settings.transcription_model, fixed_model={m.id for m in gemini},
+                                              local=local, whisper_model=settings.whisper_model)  # fmt: skip
         service = make_transcript_service(self.ctx)
         text = tr("ca.backend", backend=service.label) if service.setup_error is None else service.setup_error.message
         self.title_panel.content.set_backend_text(text)
+
+    def _on_whisper_model_changed(self, model: str) -> None:
+        self.settings = self.ctx.settings.update(whisper_model=model or "small")
+        self.refresh_transcription_ui()
+
+    def use_suggestion(self, rel_path: str, title: str) -> None:
+        """Make a validated title suggestion the file's new name in the current preview (Apply/Undo unchanged)."""
+        plan = self.preview_panel.plan
+        op = next((o for o in plan.ops if o.source == rel_path and o.kind == OpKind.RENAME), None) if plan else None
+        if plan is None or op is None:
+            self.show_status(tr("ca.use_no_preview"), "warning")
+            return
+        prefix = self.title_panel.config().series_prefix
+        ext = os.path.splitext(rel_path)[1]
+        clean = clean_title(title, prefix, ext)
+        directory, _name = WorkspacePaths.split(op.draft_target or op.target or rel_path)
+        target = WorkspacePaths.join(directory, compose_name(clean, prefix) + ext)
+        try:
+            if not clean:
+                raise PathError("empty title")
+            WorkspacePaths(plan.root).normalize_relative(target, what="name")
+        except PathError as exc:
+            self.show_status(tr("ca.title_invalid", reason=str(exc)), "error")
+            return
+        op.draft_target = target
+        plan.revalidate()  # duplicate / conflict checks exactly as for every other preview change
+        self.preview_panel.refresh_plan()
+        self.title_panel.content.mark_chosen(rel_path, title)
+        self.show_status(tr("ca.title_chosen", name=WorkspacePaths.split(target)[1]), "success")
 
     def _on_transcription_service_changed(self, service: str, model: str) -> None:
         self.settings = self.ctx.settings.update(transcription_service=service, transcription_model=model or "gpt-4o-mini-transcribe")
@@ -738,13 +777,16 @@ class MainWindow(QMainWindow):
         content.clear_results()
         content.set_running(True)
         worker = TranscriptionWorker(files, self.workspace, service, cfg.audio_seconds, cfg.transcript_language)
+        for entry in files:
+            content.set_stage(entry.rel_path, "waiting")
+        worker.signals.stage.connect(content.set_stage)  # type: ignore[attr-defined]
         worker.signals.item.connect(content.add_result)  # type: ignore[attr-defined]
         self._analysis_worker = worker
         self.run_worker(
             worker,
             on_result=lambda results: self._analysis_finished(*self._analysis_summary(results, len(files))),
             on_error=lambda msg, _e: self._analysis_finished(msg, "error"),
-            on_cancelled=lambda: self._analysis_finished(tr("ca.cancelled"), "warning"),
+            on_cancelled=lambda: (content.mark_unfinished("cancelled"), self._analysis_finished(tr("ca.cancelled"), "warning")),
         )
 
     @staticmethod

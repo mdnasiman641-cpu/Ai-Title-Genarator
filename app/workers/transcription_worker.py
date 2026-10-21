@@ -14,6 +14,7 @@ from app.workers.base_worker import BaseWorker, WorkerSignals
 
 class TranscriptionSignals(WorkerSignals):
     item = Signal(str, object)  # rel_path, TranscriptResult - one per video, as soon as it is done
+    stage = Signal(str, str)  # rel_path, stage (download / load / extract / transcribe) - live status per video
 
 
 class TranscriptionWorker(BaseWorker):
@@ -39,9 +40,9 @@ class TranscriptionWorker(BaseWorker):
         for index, entry in enumerate(self.entries):
             self.check_cancelled()
 
-            def step(stage: str, index: int = index) -> None:
-                key = "transcript.step_extract" if stage == "extract" else "transcript.step_transcribe"
-                self.emit_progress(index, total, tr(key, index=index + 1, total=total))
+            def step(stage: str, index: int = index, rel_path: str = entry.rel_path) -> None:
+                self.signals.stage.emit(rel_path, stage)  # type: ignore[attr-defined]
+                self.emit_progress(index, total, tr(f"transcript.step_{stage}", index=index + 1, total=total))
 
             self.emit_progress(index, total, tr("transcript.step_extract", index=index + 1, total=total))
             result = self.service.get(self.workspace / entry.rel_path, self.seconds, self.language, step=step)

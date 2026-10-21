@@ -16,7 +16,7 @@ review a colour-coded **preview**, click **Apply**, and can **Undo** the whole b
 3. [How a command is processed](#how-a-command-is-processed)
 4. [Safety model](#safety-model)
 5. [AI models, routing and fallback](#ai-models-routing-and-fallback)
-6. [Title Generator (unique titles, Google Search context, presets)](#title-generator) · [Video Audio / Transcript](#video-audio--transcript)
+6. [Title Generator (unique titles, Google Search context, presets)](#title-generator) · [Video Audio / Transcript (Whisper)](#video-audio--transcript-whisper)
 7. [Command examples](#command-examples)
 8. [Undo, history and the undo-trash](#undo-history-and-the-undo-trash)
 9. [Optional: durations and thumbnails (ffmpeg)](#optional-durations-and-thumbnails-ffmpeg)
@@ -171,37 +171,40 @@ terms confirmed by several sources and disagreements marked — and sent as **co
 search results (Connected modes) but refuses Independent Creative titles because those need an AI model. *Custom prompt* lets your instructions lead
 (mention "search" to add search context). The preview's note column shows `Search: ✓ 5 results · AI: Gemini / gemini-2.5-flash` per file.
 
-### Video Audio / Transcript
+### Video Audio / Transcript (Whisper)
 Choose **Video Audio / Transcript** as the information source (or in the expandable **Video Content Analysis** section) and the titles are built from what is
-actually **said** in each video, not from its file name.
+actually **said** in each video, not from its file name:
 
-1. ffmpeg extracts only the **first N seconds** of audio (60 s, 2, **3 (default)**, 5 min or custom 10–600 s) into a temporary mono 16 kHz WAV.
-   The video is never modified; the temporary folder is always deleted.
-2. The clip is transcribed by the selected **transcription service**, chosen under *Video Content Analysis → Transcription service*. The active backend is always shown,
-   e.g. `Transcription: OpenAI / gpt-4o-mini-transcribe (API)`:
-   - **Automatic** — the first configured OpenAI / OpenAI-compatible model in *AI Models*. Its base URL and its encrypted key are reused; no new key is stored.
-     The audio goes to its `/audio/transcriptions` endpoint (default model `gpt-4o-mini-transcribe`, editable, e.g. `whisper-1`). **API-based**: the audio is uploaded.
-   - **A specific OpenAI / OpenAI-compatible model** from the list.
-   - **Local (faster-whisper)** — offered only when the optional `faster-whisper` package is installed. **Local**: nothing is uploaded.
-   - **A Gemini model — Gemini audio understanding** (choose it explicitly): the clip is sent as audio input to that model's `generateContent`
-     endpoint with its existing key, and Gemini is asked for a verbatim transcript (JSON; "no speech" gives an empty transcript, a wrong
-     format is rejected — nothing is invented). Up to ~7 minutes per clip. **API-based**: the audio is uploaded to Google.
-   - Providers whose OpenAI-compatible API has **no speech-to-text endpoint** (Gemini's `…/v1beta/openai`, OpenRouter, DeepSeek, Anthropic) are
-     never sent audio: *Automatic* skips them and says why, and choosing one shows *Provider does not support transcription*.
-   - *Automatic* never picks Gemini by itself. If the chosen service is missing or unconfigured, the app says so and **never switches silently**.
-   - Failures show the actual reason in the table and status bar (e.g. `Failed — API authentication failed (HTTP 401)`,
-     `API quota exhausted (HTTP 429)`, `Provider does not support transcription (HTTP 404)`, `Video contains no audio stream`); keys are never shown or logged.
-3. The transcript (trimmed if very long) goes through the normal AI router (same models, fallback, batching) with the Title Generator settings. The AI must
-   separate **supported facts**, **interpretation** and **unknowns**, and may not invent events. The file name is sent only if *Include filename as additional
-   context* is ticked (off by default).
-4. Titles pass the usual uniqueness checks and go to the normal **preview → Apply → Undo**; extensions are kept.
+**video → first 3 minutes of audio → Whisper → clean transcript → AI analysis → 5 title suggestions checked against the transcript → preview → you approve → Apply / Undo**
 
-Videos without audio, damaged files or failed transcriptions are **skipped and reported** (Successful / Failed / Skipped). They are titled only if *If transcription
-fails, still title it* is ticked, and those titles are marked **not transcript-based** in the preview and in the analysis table.
-**Analyze Selected Videos** transcribes in the background (progress `Video 3 / 100 — Transcribing…`, **Cancel** stops before the next video) and shows
-per video: audio, transcription status, analyzed range (`00:00–03:00`), the transcript and, after Generate Preview, the content analysis and generated title.
-Transcripts are **cached** in the local database by file (path, size, modification time), duration, language and backend. A changed file is transcribed again,
-failures are retried next time, and **Clear Transcript Cache** removes them all.
+1. **Audio.** Only the **first N seconds** are read (60 s, 2, **3 (default)**, 5 min or custom; a shorter video gives all its audio) into a temporary mono 16 kHz WAV
+   with ffmpeg, or — when no ffmpeg is installed — with the decoder bundled with Whisper. The video is never modified; the temporary folder is always deleted.
+2. **Whisper.** *Video Content Analysis → Transcription service* (the backend is always shown, e.g. `Transcription: Whisper small (local, faster-whisper)`):
+   - **Automatic / Whisper on this PC** (default) — `faster-whisper`, bundled with the Windows app. Free, nothing is uploaded, no API key. The model is
+     **downloaded once** (first use needs internet) into the app's data folder and reused: `small` ≈ 480 MB (default, fast, good for English);
+     **for Bangla choose `medium` or `large-v3-turbo`** (≈ 1.5–1.6 GB, slower, much better). Runs on the CPU; an NVIDIA GPU is used only when CUDA really works.
+   - **Whisper API** — an OpenAI (`whisper-1`, default) or OpenAI-compatible model (e.g. Groq `whisper-large-v3`) from *AI Models*; its base URL and encrypted
+     key are reused. Automatic uses it only when local Whisper is not installed. Providers without a speech-to-text endpoint (Gemini's `…/v1beta/openai`,
+     OpenRouter, DeepSeek, Anthropic) are never sent audio.
+   - **Gemini audio understanding** (explicit choice only, not Whisper): the clip goes as audio input to an existing Gemini model.
+   - The language is detected automatically (Bangla, English, mixed …) or can be set. Silence and music are filtered (voice-activity detection, Whisper's
+     no-speech score, typical "Thank you." hallucinations); **no speech** or **too little speech** is reported and never treated as a transcript.
+3. **Check the transcript.** *Analyze Selected Videos* runs in the background (one video at a time, **Cancel** any time) with a live status per video —
+   *Waiting → Downloading Whisper model (first use) → Extracting audio → Transcribing audio → Completed / Failed (stage) — reason* — and shows the transcript
+   **with timestamps**. Transcripts are cached by file (path, size, modification time), duration, language and engine: a retry repeats only what failed.
+4. **Titles.** *Generate Preview* sends the transcripts (not the file names, unless *Include filename as additional context* is ticked) through the normal AI
+   router. Per video the AI returns an analysis (topic, subject, key points, strongest hook, keywords, language, audience) and **5 suggestions** in the
+   video's language, each with the words from the transcript that support it. The app **rejects** suggestions whose quote, subject, numbers or names are not
+   in the transcript, generic titles and near-duplicates, and asks once more (at most one extra request) if fewer than 5 remain. Too little content → no title.
+5. **Approve.** The best suggestion is the new name in the preview; double-click another suggestion (or *Use Selected Title*) to use it instead. Nothing is
+   renamed before **Apply**, and **Undo** works as always. Rejected suggestions are listed with the reason.
+
+Videos without audio, damaged files or failed transcriptions are **skipped and reported** with the failed stage and reason (e.g. `Failed (transcription) —
+API authentication failed (HTTP 401)`, `Video contains no audio stream`, `The Whisper model 'small' could not be downloaded …`). They are titled only if
+*If transcription fails, still title it* is ticked, and those titles are marked **not transcript-based**. Keys are never shown or logged.
+
+**Diagnostics without the GUI:** `"AI Video File Assistant.exe" --transcribe "D:\Videos\clip.mp4" --out report.json` runs extraction + Whisper with your
+settings and writes the transcript (or the exact error) to `report.json`. `tools/verify_whisper.py` checks real Whisper on real speech (run in CI).
 
 **Presets.** *Save Preset / Load Preset / Delete Preset* store the complete configuration (e.g. "Blue Bloods Facebook Titles") in the local database;
 the current panel settings are also restored automatically at start-up.

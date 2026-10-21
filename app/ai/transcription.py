@@ -1,16 +1,17 @@
-"""Speech-to-text for the Title Generator's *Video Audio / Transcript* source.
+"""Speech-to-text (Whisper) for the Title Generator's *Video Audio / Transcript* source.
 
-* **API** (default): the OpenAI-style ``POST {base_url}/audio/transcriptions`` endpoint of a model
-  configuration that already exists in *Settings → AI → AI Models* - its base URL and its
-  encrypted API key are reused, so there is no second key store and no second provider manager.
-  Works with OpenAI (``gpt-4o-mini-transcribe``, ``gpt-4o-transcribe``, ``whisper-1``) and with
-  OpenAI-compatible services that offer the same endpoint (e.g. Groq ``whisper-large-v3``).
-  Gemini's text-generation endpoint is *not* used for audio.
-* **Local** (optional): `faster-whisper` when it is installed; nothing leaves the PC.
+* **Local Whisper** (default when installed - it is bundled with the Windows app): `faster-whisper`
+  runs OpenAI's Whisper model on this PC (CPU, or an NVIDIA GPU when CUDA really works). The model
+  (default ``small``) is downloaded once into the app's data folder and reused; nothing is uploaded.
+* **Whisper API**: the OpenAI-style ``POST {base_url}/audio/transcriptions`` endpoint of a model
+  configuration that already exists in *Settings → AI → AI Models* (OpenAI ``whisper-1``, Groq
+  ``whisper-large-v3`` ...) - its base URL and encrypted API key are reused. Providers whose
+  OpenAI-compatible API has no speech-to-text endpoint are never sent audio.
+* **Gemini audio understanding** (explicit choice only): audio input to an existing Gemini model.
 
-Only a short audio clip (the first N seconds, see :mod:`app.files.audio`) is uploaded - never the
-video. Transcripts are cached per file identity (path, size, modification time) + duration +
-language + backend/model, so unchanged files are never transcribed twice.
+Only a short audio clip (the first N seconds, see :mod:`app.files.audio`) is transcribed - never the
+whole video. Transcripts are cleaned (silence/music "hallucinations" removed, meaning unchanged) and
+cached per file identity (path, size, modification time) + duration + language + engine/model.
 """
 
 from __future__ import annotations
@@ -19,11 +20,15 @@ import base64
 import hashlib
 import importlib.util
 import json
+import os
+import re
 import threading
 import time
+import unicodedata
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass, replace
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -35,7 +40,12 @@ from app.files.audio import AudioError, AudioExtractor
 from app.utils.logger import get_logger
 
 log = get_logger("ai.transcribe")
-DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+DEFAULT_TRANSCRIPTION_MODEL = "whisper-1"  # Whisper over the OpenAI API (verbose_json gives timestamps)
+DEFAULT_WHISPER_MODEL = "small"
+WHISPER_MODELS = {  # local model -> approximate one-time download (MB)
+    "tiny": 75, "base": 145, "small": 484, "medium": 1530, "large-v3-turbo": 1620, "large-v3": 3090,
+}  # fmt: skip
+MIN_MEANINGFUL_WORDS = 4  # fewer recognised words cannot describe a video
 LOCAL_SERVICE = "local"
 AUTO_SERVICE = "auto"
 DURATIONS = (60, 120, 180, 300)  # seconds; "custom" uses TitleConfig.audio_seconds directly
@@ -49,6 +59,55 @@ class TranscriptionError(Exception):
         super().__init__(message)
         self.kind = kind
         self.message = message
+
+
+# =================================================================== speech
+@dataclass(frozen=True, slots=True)
+class Segment:
+    start: float
+    end: float
+    text: str
+
+
+@dataclass(slots=True)
+class Speech:
+    """What an engine recognised: the text, the (detected) language and timestamped segments when available."""
+
+    text: str
+    language: str = ""
+    segments: list[Segment] = field(default_factory=list)
+
+
+_NON_SPEECH = re.compile(r"[\[(（【][^\])）】]{0,40}(?:music|applause|laughter|silence|noise|blank_audio|inaudible|"
+                         r"সঙ্গীত|গান|বাজনা)[^\])）】]{0,40}[\])）】]|[♪♫]+", re.IGNORECASE)  # fmt: skip
+_SILENCE_HALLUCINATIONS = {  # what Whisper typically "hears" in silence or music - never a transcript on their own
+    "you", "thank you", "thanks for watching", "thank you for watching", "thank you so much for watching",
+    "please subscribe", "subtitles by the amara.org community", "ご視聴ありがとうございました", "ধন্যবাদ",
+}  # fmt: skip
+def meaningful_words(text: str) -> int:
+    """Words of two or more characters that are not just digits (any script, incl. Bangla)."""
+    from app.ai.title_quality import words
+
+    return sum(1 for w in words(text) if len(w) >= 2 and not w.isdigit())
+
+
+def _norm_phrase(text: str) -> str:
+    return re.sub(r"[\s.,!?।'\"…-]+", " ", unicodedata.normalize("NFKC", text).casefold()).strip()
+
+
+def clean_speech(speech: Speech) -> Speech:
+    """Tidy the formatting without changing the meaning: drop non-speech markers, repeated loops and pure silence phrases."""
+    segments = speech.segments or ([Segment(0.0, 0.0, speech.text)] if speech.text.strip() else [])
+    kept: list[Segment] = []
+    for seg in segments:
+        text = re.sub(r"\s+", " ", _NON_SPEECH.sub(" ", seg.text)).strip()
+        if not text or (kept and _norm_phrase(text) == _norm_phrase(kept[-1].text)):
+            continue  # empty after cleaning, or Whisper repeating itself
+        kept.append(Segment(seg.start, seg.end, text))
+    if kept and all(_norm_phrase(seg.text) in _SILENCE_HALLUCINATIONS for seg in kept):
+        kept = []  # only "Thank you." / "Thanks for watching" etc.: silence or music, not speech
+    text = " ".join(seg.text for seg in kept)
+    return Speech(text[:MAX_TRANSCRIPT_CHARS], speech.language, kept if speech.segments else [])
 
 
 # =================================================================== backends
@@ -68,8 +127,11 @@ class Transcriber(ABC):
         """Identifies backend + model in the transcript cache key."""
 
     @abstractmethod
-    def transcribe(self, audio: Path, language: str) -> tuple[str, str]:
-        """Return ``(text, detected_language)``; raises :class:`TranscriptionError`."""
+    def transcribe(self, audio: Path, language: str) -> Speech | tuple[str, str]:
+        """Return the recognised :class:`Speech` (or ``(text, language)``); raises :class:`TranscriptionError`."""
+
+    def prepare(self, step: Callable[[str], None] | None = None) -> None:  # noqa: B027 - optional hook
+        """Load what the engine needs before the first clip (e.g. download a local model)."""
 
 
 def _multipart(fields: dict[str, str], file_field: str, file_path: Path) -> tuple[bytes, str]:
@@ -136,8 +198,12 @@ class ApiTranscriber(Transcriber):
     def cache_id(self) -> str:
         return f"api|{self.config.base_url}|{self.model}"
 
-    def transcribe(self, audio: Path, language: str) -> tuple[str, str]:
-        fields = {"model": self.model, "response_format": "json"}
+    @property
+    def whisper(self) -> bool:
+        return "whisper" in self.model.lower()
+
+    def transcribe(self, audio: Path, language: str) -> Speech:
+        fields = {"model": self.model, "response_format": "verbose_json" if self.whisper else "json"}
         if language and language != "auto":
             fields["language"] = language
         body, content_type = _multipart(fields, "file", audio)
@@ -154,8 +220,12 @@ class ApiTranscriber(Transcriber):
         text = data.get("text")
         if not isinstance(text, str):
             raise TranscriptionError("invalid", "Invalid API response: the transcription service returned no 'text' field.")
-        detected = str(data.get("language") or (language if language != "auto" else ""))
-        return text.strip()[:MAX_TRANSCRIPT_CHARS], detected
+        detected = _language_code(str(data.get("language") or (language if language != "auto" else "")))
+        segments = [Segment(float(seg.get("start") or 0), float(seg.get("end") or 0), str(seg.get("text") or "").strip())
+                    for seg in data.get("segments") or [] if isinstance(seg, dict) and _is_speech(seg)]  # fmt: skip
+        if data.get("segments") and not segments:
+            text = ""  # every segment was silence / noise
+        return Speech(text.strip()[:MAX_TRANSCRIPT_CHARS], detected, segments)
 
 
 def _explain(exc: AIError, config: ModelConfig, model: str, timeout: float, *, endpoint: str) -> TranscriptionError:
@@ -195,6 +265,24 @@ def _explain(exc: AIError, config: ModelConfig, model: str, timeout: float, *, e
     return TranscriptionError(_ERROR_KINDS.get(exc.kind, "failed"), f"Transcription failed{status}.{said}")
 
 
+_LANGUAGE_NAMES = {"english": "en", "bengali": "bn", "bangla": "bn", "hindi": "hi", "urdu": "ur", "arabic": "ar", "spanish": "es",
+                   "french": "fr", "german": "de", "italian": "it", "portuguese": "pt", "russian": "ru", "turkish": "tr",
+                   "japanese": "ja", "korean": "ko", "chinese": "zh"}  # fmt: skip
+
+
+def _language_code(value: str) -> str:
+    """The Whisper API reports full names ("english"); the app uses ISO codes ("en")."""
+    value = value.strip().lower()
+    return _LANGUAGE_NAMES.get(value, value)
+
+
+def _is_speech(segment: Any) -> bool:
+    """Whisper's own rule for silence plus a guard against repetition loops."""
+    get = segment.get if isinstance(segment, dict) else lambda key, default=None: getattr(segment, key, default)
+    no_speech, logprob, ratio = float(get("no_speech_prob", 0) or 0), float(get("avg_logprob", 0) or 0), float(get("compression_ratio", 0) or 0)
+    return not ((no_speech > 0.6 and logprob < -1.0) or ratio > 2.4)
+
+
 _GEMINI_PROMPT = (
     "Transcribe the speech in this audio clip verbatim, in the language that is spoken. Do not translate, summarise, "
     "describe sounds or music, or add anything that is not said. Answer only with JSON: "
@@ -224,7 +312,7 @@ class GeminiAudioTranscriber(Transcriber):
     def cache_id(self) -> str:
         return f"gemini|{self.config.base_url}|{self.model}"
 
-    def transcribe(self, audio: Path, language: str) -> tuple[str, str]:
+    def transcribe(self, audio: Path, language: str) -> Speech:
         data = audio.read_bytes()
         if len(data) > MAX_GEMINI_AUDIO_BYTES:
             raise TranscriptionError("too_large", "Audio upload failed: the clip is too large for Gemini (20 MB request limit). Choose 5 minutes or less.")
@@ -242,7 +330,7 @@ class GeminiAudioTranscriber(Transcriber):
             raise error from None
         return self._parse(answer, language)
 
-    def _parse(self, answer: dict[str, Any], language: str) -> tuple[str, str]:
+    def _parse(self, answer: dict[str, Any], language: str) -> Speech:
         candidates = answer.get("candidates") or []
         if not candidates:
             block = (answer.get("promptFeedback") or {}).get("blockReason")
@@ -261,18 +349,30 @@ class GeminiAudioTranscriber(Transcriber):
             raise TranscriptionError("invalid", "Invalid API response: Gemini did not return the requested transcript format.")
         text = "" if result.get("speech") is False else str(result.get("transcript") or "")
         detected = str(result.get("language") or (language if language != "auto" else ""))
-        return text.strip()[:MAX_TRANSCRIPT_CHARS], detected
+        return Speech(text.strip()[:MAX_TRANSCRIPT_CHARS], detected)
+
+
+_LOADED_MODELS: dict[tuple[str, str], Any] = {}  # loaded once per app run, shared by every batch
+_LOAD_LOCK = threading.Lock()
+
+
+def whisper_models_dir() -> Path:
+    from app.utils.helpers import get_app_data_dir
+
+    return get_app_data_dir() / "whisper-models"
 
 
 class LocalWhisperTranscriber(Transcriber):
-    """Optional on-device transcription with `faster-whisper` (only offered when installed)."""
+    """Whisper on this PC with `faster-whisper` (bundled with the Windows app; offered only when importable)."""
 
     local = True
 
-    def __init__(self, model: str = "small") -> None:
-        self.model_name = model if model and "transcribe" not in model and not model.startswith("gpt") else "small"
-        self._model: Any = None
-        self._lock = threading.Lock()
+    def __init__(self, model: str = DEFAULT_WHISPER_MODEL, models_dir: Path | None = None, device: str = "auto") -> None:
+        model = (model or "").strip()
+        self.model_name = model if model and "transcribe" not in model and not model.startswith(("gpt", "whisper-1")) else DEFAULT_WHISPER_MODEL
+        self.models_dir = models_dir or whisper_models_dir()
+        self.device = device if device in ("auto", "cpu", "cuda") else "auto"
+        self.device_used = ""
 
     @staticmethod
     def available() -> bool:
@@ -280,26 +380,76 @@ class LocalWhisperTranscriber(Transcriber):
 
     @property
     def label(self) -> str:
-        return f"faster-whisper / {self.model_name} (local)"
+        return f"Whisper {self.model_name} (local, faster-whisper)"
 
     @property
     def cache_id(self) -> str:
-        return f"local|{self.model_name}"
+        return f"local|whisper|{self.model_name}"
 
-    def transcribe(self, audio: Path, language: str) -> tuple[str, str]:
-        if not self.available():
-            raise TranscriptionError("not_configured", "Local transcription needs the optional 'faster-whisper' package.")
+    def model_downloaded(self) -> bool:
+        if os.path.isdir(self.model_name):
+            return True  # a model folder chosen by path
         try:
-            with self._lock:
-                if self._model is None:
-                    from faster_whisper import WhisperModel  # type: ignore[import-not-found]
+            from faster_whisper.utils import download_model  # type: ignore[import-not-found]
 
-                    self._model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
-                segments, info = self._model.transcribe(str(audio), language=None if language == "auto" else language)
-                text = " ".join(segment.text.strip() for segment in segments)
+            download_model(self.model_name, local_files_only=True, cache_dir=str(self.models_dir))
+            return True
+        except Exception:  # noqa: BLE001 - not downloaded yet (or unknown name: reported when loading)
+            return False
+
+    def prepare(self, step: Callable[[str], None] | None = None) -> None:
+        self._model(step)
+
+    def _model(self, step: Callable[[str], None] | None = None) -> Any:
+        if not self.available():
+            raise TranscriptionError("not_configured", "Whisper is unavailable: the local Whisper engine (faster-whisper) is not installed.")
+        key = (self.model_name, self.device)
+        with _LOAD_LOCK:
+            if key in _LOADED_MODELS:
+                return _LOADED_MODELS[key]
+            os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")  # no console in the GUI app
+            os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+            self.models_dir.mkdir(parents=True, exist_ok=True)
+            if step and not self.model_downloaded():
+                step("download")
+            elif step:
+                step("load")
+            try:
+                import ctranslate2  # type: ignore[import-not-found]
+                from faster_whisper import WhisperModel  # type: ignore[import-not-found]
+            except Exception as exc:  # noqa: BLE001
+                raise TranscriptionError("not_configured", f"Whisper is unavailable: the local engine could not start ({exc}).") from None
+            attempts = [("cpu", "int8")]
+            if self.device != "cpu" and ctranslate2.get_cuda_device_count() > 0:
+                attempts.insert(0, ("cuda", "float16"))  # only when CUDA really works; otherwise the CPU is used
+            last: Exception | None = None
+            for device, compute in attempts:
+                try:
+                    model = WhisperModel(self.model_name, device=device, compute_type=compute, download_root=str(self.models_dir))
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+                    log.info("Whisper %s could not load on %s: %s", self.model_name, device, exc)
+                    continue
+                self.device_used = device
+                _LOADED_MODELS[key] = model
+                log.info("Whisper %s loaded on %s (%s)", self.model_name, device, compute)
+                return model
+            text = str(last or "")
+            if not self.model_downloaded():
+                raise TranscriptionError("model_download", f"The Whisper model '{self.model_name}' could not be downloaded "
+                                         f"(first use needs internet, about {WHISPER_MODELS.get(self.model_name, '?')} MB): {text}")  # fmt: skip
+            raise TranscriptionError("model_load", f"The local Whisper model '{self.model_name}' could not be loaded: {text}")
+
+    def transcribe(self, audio: Path, language: str) -> Speech:
+        model = self._model()
+        try:
+            segments, info = model.transcribe(str(audio), language=None if language in ("", "auto") else language, beam_size=5,
+                                              vad_filter=True, condition_on_previous_text=False)  # fmt: skip
+            kept = [Segment(round(seg.start, 2), round(seg.end, 2), seg.text.strip()) for seg in segments if _is_speech(seg)]
         except Exception as exc:  # noqa: BLE001 - third-party engine: report, never crash
-            raise TranscriptionError("failed", f"Local transcription failed: {exc}") from None
-        return text.strip()[:MAX_TRANSCRIPT_CHARS], str(getattr(info, "language", "") or "")
+            raise TranscriptionError("failed", f"Local Whisper transcription failed: {exc}") from None
+        text = " ".join(seg.text for seg in kept)
+        return Speech(text.strip()[:MAX_TRANSCRIPT_CHARS], str(getattr(info, "language", "") or ""), kept)
 
 
 def transcription_candidates(registry: Any) -> list[ModelConfig]:
@@ -317,11 +467,15 @@ def build_transcriber(registry: Any, settings: Any) -> Transcriber:
     """The backend chosen in the Title Generator - never silently another one."""
     service = settings.transcription_service or AUTO_SERVICE
     timeout = settings.transcription_timeout_s
+    local_model = getattr(settings, "whisper_model", DEFAULT_WHISPER_MODEL)
+    device = getattr(settings, "whisper_device", "auto")
     if service == LOCAL_SERVICE:
         if not LocalWhisperTranscriber.available():
-            raise TranscriptionError("not_configured", "Local transcription is selected but 'faster-whisper' is not installed.")
-        return LocalWhisperTranscriber(settings.transcription_model)
+            raise TranscriptionError("not_configured", "Whisper is unavailable: local Whisper is selected but 'faster-whisper' is not installed.")
+        return LocalWhisperTranscriber(local_model, device=device)
     if service == AUTO_SERVICE:
+        if LocalWhisperTranscriber.available():  # free and private: no API key, nothing uploaded
+            return LocalWhisperTranscriber(local_model, device=device)
         config = next((m for m in transcription_candidates(registry) if m.provider_type == "openai"), None)
         if config is None:
             skipped = [speech_to_text_problem(m) for m in registry.list()
@@ -329,7 +483,8 @@ def build_transcriber(registry: Any, settings: Any) -> Transcriber:
             hint = " Or choose a Gemini model (audio understanding) in Transcription service." if gemini_candidates(registry) else ""
             raise TranscriptionError(
                 "not_configured",
-                "No speech-to-text service is configured. Add an OpenAI model with its API key (Settings → AI → AI Models), "
+                "Whisper is unavailable: the local Whisper engine is not installed and no Whisper API is configured. "
+                "Add an OpenAI model with its API key (Settings → AI → AI Models), "
                 "or choose an OpenAI-compatible model that offers speech-to-text in Video Content Analysis." + hint
                 + (" " + " ".join(p for p in skipped if p) if skipped else ""),
             )
@@ -350,7 +505,11 @@ def build_transcriber(registry: Any, settings: Any) -> Transcriber:
 # ============================================================= service + cache
 @dataclass(slots=True)
 class TranscriptResult:
-    """What happened for one video (``status``: ok, empty, no_audio, failed)."""
+    """What happened for one video (``status``: ok, empty, insufficient, no_audio, failed).
+
+    ``stage`` names where a failure happened: ``extract`` (audio) or ``transcribe`` (Whisper / API).
+    ``segments``: ``{"start", "end", "text"}`` dicts when the engine gives timestamps.
+    """
 
     status: str
     text: str = ""
@@ -360,6 +519,18 @@ class TranscriptResult:
     error: str = ""
     error_kind: str = ""
     from_cache: bool = False
+    stage: str = ""
+    segments: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def words(self) -> int:
+        return meaningful_words(self.text)
+
+    def timestamped(self, limit: int = 200) -> list[str]:
+        """``[00:12] text`` lines (or the plain text when there are no timestamps)."""
+        if not self.segments:
+            return [self.text] if self.text else []
+        return [f"[{_clock(seg.get('start', 0))}–{_clock(seg.get('end', 0))}] {seg.get('text', '')}" for seg in self.segments[:limit]]
 
     @property
     def ok(self) -> bool:
@@ -376,7 +547,12 @@ class TranscriptResult:
         return data
 
 
-_PER_FILE_KINDS = ("no_audio", "unreadable", "empty")
+def _clock(seconds: Any) -> str:
+    total = int(float(seconds or 0))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+_PER_FILE_KINDS = ("no_audio", "unreadable", "empty", "insufficient")
 
 
 def main_failure(results: list[TranscriptResult]) -> TranscriptResult | None:
@@ -401,6 +577,7 @@ class TranscriptService:
         self.setup_error = setup_error
         self.requests = 0  # real transcription calls (for status/tests)
         self._memo: dict[str, TranscriptResult] = {}
+        self._prepare_error: TranscriptionError | None = None  # e.g. model download failed: not retried for every video
 
     @property
     def label(self) -> str:
@@ -442,7 +619,7 @@ class TranscriptService:
         except OSError as exc:
             return TranscriptResult("failed", error=f"The file cannot be read: {exc.strerror or exc}", error_kind="unreadable")
         result = self._transcribe(source, seconds, language, step)
-        if result.status in ("ok", "empty", "no_audio"):  # deterministic outcomes are worth remembering
+        if result.status in ("ok", "empty", "insufficient", "no_audio"):  # deterministic outcomes are worth remembering
             self._memo[key] = result
             if self.db is not None:
                 try:
@@ -454,28 +631,46 @@ class TranscriptService:
     def _transcribe(self, source: Path, seconds: float, language: str, step: Any) -> TranscriptResult:
         assert self.transcriber is not None
         backend = self.transcriber.label
+        stage = "transcribe"
         try:
+            if self._prepare_error is not None:
+                raise self._prepare_error
+            try:
+                self.transcriber.prepare(step)  # e.g. download / load the local Whisper model once
+            except TranscriptionError as exc:
+                self._prepare_error = exc
+                raise
+            stage = "extract"
             if step:
                 step("extract")
             with self.extractor.extracted_audio(source, seconds) as clip:
+                stage = "transcribe"
                 if step:
                     step("transcribe")
                 self.requests += 1
-                text, detected = self.transcriber.transcribe(clip.path, language)
+                raw = self.transcriber.transcribe(clip.path, language)
                 analyzed = clip.seconds
         except AudioError as exc:
             status = "no_audio" if exc.kind == "no_audio" else "failed"
-            return TranscriptResult(status, error=exc.message, error_kind=exc.kind, backend=backend)
+            return TranscriptResult(status, error=exc.message, error_kind=exc.kind, backend=backend, stage="extract")
         except TranscriptionError as exc:
             log.warning("transcription failed (%s) for %s", exc.kind, source.name)
-            return TranscriptResult("failed", error=exc.message, error_kind=exc.kind, backend=backend)
+            return TranscriptResult("failed", error=exc.message, error_kind=exc.kind, backend=backend, stage=stage)
         except Exception as exc:  # noqa: BLE001 - one video's unexpected problem must not end the whole batch
             log.exception("unexpected transcription error for %s", source.name)
-            return TranscriptResult("failed", error=f"Transcription failed: {type(exc).__name__}: {exc}", error_kind="failed", backend=backend)
-        if not text.strip():
-            return TranscriptResult("empty", language=detected, analyzed_seconds=analyzed, backend=backend,
-                                    error="No speech was recognised in the analysed part.", error_kind="empty")  # fmt: skip
-        return TranscriptResult("ok", text=text, language=detected, analyzed_seconds=analyzed, backend=backend)
+            return TranscriptResult("failed", error=f"Transcription failed: {type(exc).__name__}: {exc}", error_kind="failed",
+                                    backend=backend, stage=stage)  # fmt: skip
+        speech = clean_speech(raw if isinstance(raw, Speech) else Speech(str(raw[0]), str(raw[1])))
+        segments = [{"start": seg.start, "end": seg.end, "text": seg.text} for seg in speech.segments]
+        common = {"language": speech.language, "analyzed_seconds": analyzed, "backend": backend, "segments": segments}
+        if not speech.text.strip():
+            return TranscriptResult("empty", error="No speech detected in the analysed part (silence, music or noise only).",
+                                    error_kind="empty", **common)  # fmt: skip
+        words = meaningful_words(speech.text)
+        if words < MIN_MEANINGFUL_WORDS:
+            return TranscriptResult("insufficient", text=speech.text, error=f"Too little speech to describe the video "
+                                    f"(only {words} word(s) recognised).", error_kind="insufficient", **common)  # fmt: skip
+        return TranscriptResult("ok", text=speech.text, **common)
 
     def clear_cache(self) -> int:
         return self.db.purge_transcript_cache() if self.db is not None else 0

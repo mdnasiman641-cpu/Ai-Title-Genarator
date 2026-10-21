@@ -1,9 +1,13 @@
 """AI Video File Assistant - application entry point.
 
 Run normally to start the app. ``--self-test`` runs a headless end-to-end check
-(resources, translations, theme, database, scan, plan, apply, undo) in a
-temporary folder and exits with status 0 on success; ``build.bat`` uses it to
+(resources, translations, theme, database, scan, plan, apply, undo, bundled Whisper engine)
+in a temporary folder and exits with status 0 on success; ``build.bat`` uses it to
 verify the packaged executable.
+
+``--transcribe VIDEO [--out report.json]`` runs the real transcription pipeline (audio
+extraction -> Whisper, with the saved settings) on one video and writes the result as JSON -
+a diagnostic for "why does transcription fail on this PC?" that needs no GUI.
 """
 
 from __future__ import annotations
@@ -12,6 +16,61 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+
+if sys.stdout is None:  # the windowed (no console) exe has no stdout/stderr: printing or progress bars would crash
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115 - lives as long as the process
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+
+
+def _whisper_engine_check(work: Path) -> str:
+    """The bundled local Whisper engine imports and its built-in audio decoder works (no model needed)."""
+    import math
+    import struct
+    import wave
+
+    import av  # noqa: F401 - bundled FFmpeg decoders
+    import ctranslate2  # noqa: F401 - Whisper inference engine
+    import faster_whisper
+    import onnxruntime  # noqa: F401 - voice activity detection
+
+    from app.files.audio import AudioExtractor
+
+    assets = Path(faster_whisper.__file__).parent / "assets"
+    assert any(assets.glob("silero*.onnx")), "Whisper voice-activity model was not bundled"
+    tone = work / "tone.wav"
+    with wave.open(str(tone), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(22050)
+        out.writeframes(b"".join(struct.pack("<h", int(8000 * math.sin(i / 10))) for i in range(22050)))
+    extractor = AudioExtractor()
+    extractor.binary, extractor.builtin = None, True  # force the built-in decoder
+    with extractor.extracted_audio(tone, 30) as clip:
+        assert 0.9 <= clip.seconds <= 1.1, f"built-in decoder returned {clip.seconds}s"
+    return f"Whisper engine OK (faster-whisper {faster_whisper.__version__})"
+
+
+def transcribe_file(video: str, out: str | None) -> int:
+    """Diagnostic: transcribe one video with the saved settings and write a JSON report."""
+    import json
+
+    from app.ai.transcription import make_transcript_service
+    from app.context import AppContext
+    from app.utils.logger import setup_logging
+
+    ctx = AppContext.create()
+    settings = ctx.settings.load()
+    setup_logging(settings.log_level)
+    service = make_transcript_service(ctx)
+    stages: list[str] = []
+    result = service.get(Path(video), 180, "auto", step=stages.append)
+    report = {"video": video, "backend": service.label, "stages": stages, **result.to_dict(), "words": result.words}
+    text = json.dumps(report, ensure_ascii=False, indent=2)
+    if out:
+        Path(out).write_text(text, encoding="utf-8")
+    print(text)
+    return 0 if result.ok else 2
 
 
 def self_test() -> int:
@@ -66,6 +125,7 @@ def self_test() -> int:
         window = MainWindow(ctx)  # builds every panel (not shown)
         window.close()
         report.append("main window OK")
+        report.append(_whisper_engine_check(work))
     except Exception as exc:  # noqa: BLE001 - report any failure as a non-zero exit
         report.append(f"SELF-TEST FAILED: {type(exc).__name__}: {exc}")
         (work / "selftest.txt").write_text("\n".join(report), encoding="utf-8")
@@ -82,6 +142,10 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv if argv is None else argv
     if "--self-test" in argv:
         return self_test()
+    if "--transcribe" in argv:
+        index = argv.index("--transcribe")
+        out = argv[argv.index("--out") + 1] if "--out" in argv else None
+        return transcribe_file(argv[index + 1], out)
 
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication

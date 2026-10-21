@@ -21,6 +21,18 @@ def _isolated_data_dir(tmp_path, monkeypatch):
     return data
 
 
+@pytest.fixture(autouse=True)
+def _no_local_whisper(request, monkeypatch):
+    """Tests behave the same whether or not faster-whisper is installed (it is in the Windows build).
+
+    Tests that exercise local Whisper opt in with ``@pytest.mark.local_whisper`` and provide a fake engine.
+    """
+    if "local_whisper" not in request.keywords:
+        from app.ai.transcription import LocalWhisperTranscriber
+
+        monkeypatch.setattr(LocalWhisperTranscriber, "available", staticmethod(lambda: False))
+
+
 @pytest.fixture
 def workspace(tmp_path) -> Path:
     """An empty folder to act as the user's selected workspace."""

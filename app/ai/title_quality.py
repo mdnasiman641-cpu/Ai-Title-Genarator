@@ -17,7 +17,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
-_WORD = re.compile(r"[^\W_]+(?:['’\-][^\W_]+)*", re.UNICODE)
+# Letters/digits plus the combining vowel signs of Indic scripts (Bangla "কথা" is one word, not "ক" + "থ");
+# the danda "।" / "॥" (U+0964/5) stays punctuation.
+_LETTER = r"(?:[^\W_]|[\u0300-\u036f\u0900-\u0963\u0966-\u0dff\u200c\u200d])"
+_WORD = re.compile(rf"{_LETTER}+(?:['’\-]{_LETTER}+)*", re.UNICODE)
 STOPWORDS = frozenset(
     "a an the and or but of to in on at for with by from as into onto over under after before about against between "
     "through during without within is are was were be been being it its this that these those his her their our your "

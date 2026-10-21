@@ -286,6 +286,12 @@ class PreviewPanel(Card):
         self._update_summary()
         self._fit_rows()
 
+    def refresh_plan(self) -> None:
+        """Re-show the current plan after it was changed and revalidated (e.g. another title was chosen)."""
+        self.model.refresh()
+        self._update_summary()
+        self._fit_rows()
+
     def clear(self) -> None:
         self.plan = None
         self.model.set_plan(None)
