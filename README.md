@@ -182,7 +182,8 @@ actually **said** in each video, not from its file name:
 2. **Whisper.** *Video Content Analysis → Transcription service* (the backend is always shown, e.g. `Transcription: Whisper small (local, faster-whisper)`):
    - **Automatic / Whisper on this PC** (default) — `faster-whisper`, bundled with the Windows app. Free, nothing is uploaded, no API key. The model is
      **downloaded once** (first use needs internet) into the app's data folder and reused: `small` ≈ 480 MB (default, fast, good for English);
-     **for Bangla choose `medium` or `large-v3-turbo`** (≈ 1.5–1.6 GB, slower, much better). Runs on the CPU; an NVIDIA GPU is used only when CUDA really works.
+     **for Bangla choose `medium` or `large-v3-turbo`** (≈ 1.5–1.6 GB, slower, much better) **and set *Transcription language* to বাংলা** — automatic detection can mistake
+     Bangla for English and write it in Latin letters. Runs on the CPU; an NVIDIA GPU is used only when CUDA really works.
    - **Whisper API** — an OpenAI (`whisper-1`, default) or OpenAI-compatible model (e.g. Groq `whisper-large-v3`) from *AI Models*; its base URL and encrypted
      key are reused. Automatic uses it only when local Whisper is not installed. Providers without a speech-to-text endpoint (Gemini's `…/v1beta/openai`,
      OpenRouter, DeepSeek, Anthropic) are never sent audio.
